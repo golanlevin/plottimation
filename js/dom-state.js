@@ -8,6 +8,7 @@
  * Preset paper dimensions used only for aspect ratio and UI convenience.
  */
 export const PAPER_PRESETS = {
+  square: { width: 12, height: 12 },
   letter: { width: 11, height: 8.5 },
   legal: { width: 14, height: 8.5 },
   tabloid: { width: 17, height: 11 },
@@ -46,6 +47,13 @@ const domGroups = {
     dropZone: q("#dropZone"),
     fileInput: q("#fileInput"),
     loadDemoSelect: q("#loadDemoSelect"),
+  },
+  perFrameStripRefs: {
+    perFrameStripPanel: q("#perFrameStripPanel"),
+    perFrameStripHeading: q("#perFrameStripHeading"),
+    perFrameStripCount: q("#perFrameStripCount"),
+    perFrameStrip: q("#perFrameStrip"),
+    perFrameStripFileInput: q("#perFrameStripFileInput"),
   },
   groups: {
     layoutGroup: q("#layoutGroup"),
@@ -97,6 +105,7 @@ const domGroups = {
     alignmentPipelineField: q("#alignmentPipelineField"),
     alignmentPipelineMarkerless: q("#alignmentPipelineMarkerless"),
     alignmentPipelineMarkers: q("#alignmentPipelineMarkers"),
+    alignmentPipelinePerFrame: q("#alignmentPipelinePerFrame"),
     stabilizationMethodGroup: q("#stabilizationMethodGroup"),
     stabilizationMethodField: q("#stabilizationMethodField"),
     stabilizationMethodPairwise: q("#stabilizationMethodPairwise"),
@@ -276,6 +285,9 @@ export const state = {
     mobileSingleViewerMode: false,
     activeViewerTab: "raw",
     activeMobileControlTab: "layout",
+    // Phase 3 dev flag: forces readConfig() to emit alignmentPipeline "per-frame" before the
+    // real radio (Phase 6) exists, so the per-frame pipeline can be exercised from the console.
+    forcePerFrameMode: false,
   },
   source: {
     image: null,
@@ -286,6 +298,19 @@ export const state = {
     dragUrl: "",
     ownedObjectUrl: "",
     canvas: document.createElement("canvas"),
+    // Per-image source entries for the per-frame pipeline. The legacy fields above project the
+    // active entry. During Phase 2 this array always holds 0 or 1 entries. See js/source-images.js.
+    images: [],
+    activeImageIndex: 0,
+    // Per-frame settings restore buffer. When a per-frame `_settings.txt` is loaded before its images
+    // arrive (the reload story: a saved project cannot embed image data, so the user re-uploads the
+    // same N images in the same order), the parsed per-image overrides are stashed here and applied
+    // to `state.source.images[i]` by upload order as each image arrives, then consumed/cleared.
+    // Shape: { count: number, overrides: Array<{ manualPageContour: {x:number,y:number}[] | null,
+    //          postRotationDeg: number } | null> } | null. `null` means no pending restore (legacy /
+    // markers / markerless files leave this null). Each `overrides[i]` is null when image `i` had no
+    // saved override of either kind.
+    pendingPerImageOverrides: null,
     rawPageContour: null,
     // Tracks where the currently drawn page quad came from; this is display/status metadata, not
     // an instruction to bypass full-resolution page detection.

@@ -115,6 +115,9 @@ export function applyCropGeometryDefaults(dom) {
 export function applyNonLayoutDefaults(dom) {
   dom.alignmentPipelineMarkers.checked = SETTINGS_DEFAULTS.detection.alignmentPipeline === "markers";
   dom.alignmentPipelineMarkerless.checked = SETTINGS_DEFAULTS.detection.alignmentPipeline === "markerless";
+  if (dom.alignmentPipelinePerFrame) {
+    dom.alignmentPipelinePerFrame.checked = SETTINGS_DEFAULTS.detection.alignmentPipeline === "per-frame";
+  }
   if (dom.stabilizationMethodPairwise) {
     dom.stabilizationMethodPairwise.checked = SETTINGS_DEFAULTS.detection.stabilizationMethod === "pairwise-cyclic";
   }

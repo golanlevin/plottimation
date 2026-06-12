@@ -93,6 +93,9 @@ export function applyLoadedSettingsText({
   if (!settingsText.trim()) return;
   state.geometry.manualMarkerOverrides.clear();
   state.source.manualPageContour = null;
+  // Legacy / markers / markerless files leave this null; per-frame files repopulate it below. Reset
+  // first so a markers file loaded after a per-frame file does not leave a stale pending buffer.
+  state.source.pendingPerImageOverrides = null;
   const entries = new Map(
     settingsText
       .split(/\r?\n/)
@@ -144,11 +147,25 @@ export function applyLoadedSettingsText({
   setIfPresent("post_rotation_deg", dom.postRotation);
   const pipeline = entries.get("alignment_pipeline");
   const markerType = entries.get("alignment_marker_type");
+  const usePerFramePipeline = pipeline === "per-frame";
   const useMarkerlessPipeline =
-    pipeline === "markerless" ||
-    (pipeline !== "markers" && markerType === "none");
+    !usePerFramePipeline &&
+    (pipeline === "markerless" || (pipeline !== "markers" && markerType === "none"));
+  if (dom.alignmentPipelinePerFrame) {
+    dom.alignmentPipelinePerFrame.checked = usePerFramePipeline;
+  }
   dom.alignmentPipelineMarkerless.checked = useMarkerlessPipeline;
-  dom.alignmentPipelineMarkers.checked = !useMarkerlessPipeline;
+  // Per-frame is mutually exclusive with markers; without the radio (older DOM) we fall back to
+  // markers so the legacy two-radio invariant (`markers = !markerless`) is preserved.
+  dom.alignmentPipelineMarkers.checked = !useMarkerlessPipeline && !usePerFramePipeline;
+  // Reconcile the legacy `forcePerFrameMode` shim the same way the alignment-pipeline change-listener
+  // does (Phase 6), so the radio and the runtime flag never diverge after a settings load.
+  state.runtime.forcePerFrameMode = usePerFramePipeline;
+  // Parse the indexed per-image override keys into a pending buffer (consumed as images arrive, by
+  // upload order). Only present for per-frame files; legacy files leave the buffer null.
+  if (usePerFramePipeline) {
+    state.source.pendingPerImageOverrides = parsePerImageOverrides(entries);
+  }
   const stabilizationMethod = entries.get("stabilization_method");
   if (dom.stabilizationMethodAverage && dom.stabilizationMethodPairwise) {
     const useAverageMethod = stabilizationMethod === "difference-from-average";
@@ -248,14 +265,6 @@ export function applyLoadedSettingsText({
   }
   syncPageCornerEditingUi?.();
   syncRawPhotoCreditDisplay?.();
-  if (dom.frameCountToExport) {
-    const cols = Math.max(1, Math.min(20, Math.round(Number(dom.frameCols.value) || settingsDefaults.layout.frameCols)));
-    const rows = Math.max(1, Math.min(20, Math.round(Number(dom.frameRows.value) || settingsDefaults.layout.frameRows)));
-    const maxFrameCount = Math.max(1, cols * rows);
-    dom.frameCountToExport.min = "1";
-    dom.frameCountToExport.max = String(maxFrameCount);
-    state.runtime.lastFrameExportCountMax = maxFrameCount;
-  }
   updateSliderReadouts();
 }
 
@@ -275,6 +284,47 @@ function parsePageCornerOverrides(entries) {
   if (!cornerKeys.every((key) => entries.has(key))) return null;
   const points = cornerKeys.map((key) => parsePoint(entries.get(key)));
   return points.every(Boolean) ? points : null;
+}
+
+/**
+ * Parse the indexed per-image overrides emitted by per-frame settings files into a pending buffer.
+ *
+ * Reads `per_frame_image_count` to size the buffer, then for each index `i` collects the four
+ * `page_corner_override_{tl,tr,br,bl}_i` rows (only when all four are present and valid) and the
+ * optional `per_frame_post_rotation_deg_i` row. The result is consumed by upload order as images
+ * arrive (index 0 → first uploaded image); see `state.source.pendingPerImageOverrides` in
+ * `js/dom-state.js` for the shape. An index with no saved override of either kind yields `null`.
+ *
+ * @param {Map<string, string>} entries
+ * @returns {{ count: number, overrides: Array<{ manualPageContour: {x:number,y:number}[] | null, postRotationDeg: number } | null> } | null}
+ */
+function parsePerImageOverrides(entries) {
+  const rawCount = Number(entries.get("per_frame_image_count"));
+  const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.floor(rawCount) : 0;
+  const overrides = [];
+  for (let index = 0; index < count; index += 1) {
+    const cornerKeys = [
+      `page_corner_override_tl_${index}`,
+      `page_corner_override_tr_${index}`,
+      `page_corner_override_br_${index}`,
+      `page_corner_override_bl_${index}`,
+    ];
+    let manualPageContour = null;
+    if (cornerKeys.every((key) => entries.has(key))) {
+      const points = cornerKeys.map((key) => parsePoint(entries.get(key)));
+      if (points.every(Boolean)) manualPageContour = points;
+    }
+    let postRotationDeg = 0;
+    const rawRotation = entries.get(`per_frame_post_rotation_deg_${index}`);
+    if (rawRotation !== undefined) {
+      const parsed = Number(rawRotation);
+      if (Number.isFinite(parsed)) postRotationDeg = parsed;
+    }
+    overrides.push(
+      manualPageContour || postRotationDeg !== 0 ? { manualPageContour, postRotationDeg } : null,
+    );
+  }
+  return { count, overrides };
 }
 
 /**
@@ -301,6 +351,7 @@ function parsePoint(value) {
  *   sourceCredit?: string,
  *   manualMarkerOverrides: Map<string, {x:number, y:number}>,
  *   manualPageContour?: {x:number, y:number}[] | null,
+ *   perImageEntries?: Array<{ manualPageContour?: {x:number, y:number}[] | null, postRotationDeg?: number }> | null,
  *   sanitizeFilenameBase: (filename:string) => string,
  * }} deps
  * @returns {string}
@@ -311,6 +362,7 @@ export function buildSettingsTsv({
   sourceCredit = "",
   manualMarkerOverrides,
   manualPageContour = null,
+  perImageEntries = null,
   sanitizeFilenameBase,
 }) {
   const rows = [
@@ -381,5 +433,28 @@ export function buildSettingsTsv({
         return [`page_corner_override_${cornerName}`, `${point.x},${point.y}`];
       })
     : [];
-  return [...rows, ...pageCornerOverrideRows, ...overrideRows].map(([key, value]) => `${key}\t${value}`).join("\n") + "\n";
+  // Per-frame mode persists one set of page-corner overrides + post-rotation per uploaded image,
+  // keyed by upload-order index. Reusing the exact single-image serialization format (corner names,
+  // comma-separated points) suffixed with `_i` keeps the file humanly inspectable. The keys are only
+  // emitted in per-frame mode; markers/markerless files stay byte-identical to before (additive).
+  const perFrameRows = [];
+  if (config.alignmentPipeline === "per-frame" && Array.isArray(perImageEntries)) {
+    perFrameRows.push(["per_frame_image_count", String(perImageEntries.length)]);
+    perImageEntries.forEach((entry, index) => {
+      const contour = entry?.manualPageContour;
+      if (Array.isArray(contour) && contour.length === 4) {
+        ["tl", "tr", "br", "bl"].forEach((cornerName, cornerIndex) => {
+          const point = contour[cornerIndex];
+          perFrameRows.push([`page_corner_override_${cornerName}_${index}`, `${point.x},${point.y}`]);
+        });
+      }
+      const postRotationDeg = Number(entry?.postRotationDeg);
+      if (Number.isFinite(postRotationDeg) && postRotationDeg !== 0) {
+        perFrameRows.push([`per_frame_post_rotation_deg_${index}`, String(postRotationDeg)]);
+      }
+    });
+  }
+  return [...rows, ...pageCornerOverrideRows, ...overrideRows, ...perFrameRows]
+    .map(([key, value]) => `${key}\t${value}`)
+    .join("\n") + "\n";
 }

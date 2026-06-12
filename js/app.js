@@ -20,6 +20,7 @@ import {
   updateExportButtonLabel as updateExportButtonLabelViaController,
   revokeGifUrl as revokeGifUrlViaController,
   sanitizeFilenameBase,
+  detectMp4ExportSupport,
   exportGif as exportGifViaController,
   exportMp4 as exportMp4ViaController,
   exportZip as exportZipViaController,
@@ -35,6 +36,8 @@ import {
   releaseOwnedSourceUrl as releaseSourceUrl,
   handleFile as loadFileSource,
   loadImageSource as loadImageSourceViaController,
+  decodeImageElement,
+  applyPendingPerImageOverrides,
 } from "./load-controller.js";
 import {
   releaseRectifiedDragUrl as releaseRectifiedDragAsset,
@@ -69,6 +72,14 @@ import {
   extractSingleFrameToCanvas,
 } from "./pipeline.js";
 import { applyTranslations, getTooltipText, t } from "./i18n.js";
+import {
+  setActiveSourceImage,
+  setActiveManualPageContour,
+  setActivePostRotationDeg,
+  createSourceImageEntry,
+  releaseEntryRectifiedCache,
+} from "./source-images.js";
+import { renderPerFrameStrip } from "./per-frame-strip.js";
 // Final output-size scaling can be done either with browser canvas drawImage() or with OpenCV.
 // Keep both code paths available for comparison while evaluating tiny-output quality.
 const bUseOpenCvOutputScaling = true;
@@ -116,36 +127,6 @@ function mapEncodingQualityToGifEncoderQuality(encodingQuality) {
   const clamped = Math.max(1, Math.min(100, encodingQuality));
   const normalized = (clamped - 1) / 99;
   return Math.max(1, Math.min(20, Math.round(20 - (normalized * 19))));
-}
-
-/**
- * Probe whether this browser can encode H.264 frames with WebCodecs for later MP4 muxing.
- *
- * @returns {Promise<{supported:boolean, codec:string}>}
- */
-async function detectMp4ExportSupport() {
-  if (typeof globalThis.VideoEncoder === "undefined" || typeof VideoEncoder.isConfigSupported !== "function") {
-    return { supported: false, codec: "" };
-  }
-  const candidates = ["avc1.42001f", "avc1.42E01E", "avc1.4D401E"];
-  for (const codec of candidates) {
-    try {
-      const support = await VideoEncoder.isConfigSupported({
-        codec,
-        width: 16,
-        height: 16,
-        bitrate: 500_000,
-        framerate: 20,
-        avc: { format: "avc" },
-      });
-      if (support?.supported) {
-        return { supported: true, codec };
-      }
-    } catch {
-      // Try the next H.264 profile string.
-    }
-  }
-  return { supported: false, codec: "" };
 }
 
 /**
@@ -241,7 +222,85 @@ function maybeLoadStartupDemoFromUrl(manifestFilenames) {
   if (dom.loadDemoSelect) {
     dom.loadDemoSelect.value = requestedDemo;
   }
-  void loadImageSource(`demo/${requestedDemo}`, requestedDemo);
+  void loadSelectedDemo(requestedDemo);
+}
+
+/**
+ * Guess an image MIME type from a filename extension.
+ *
+ * @param {string} filename
+ * @returns {string}
+ */
+function guessImageMimeType(filename) {
+  const lower = String(filename || "").toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  return "image/jpeg";
+}
+
+/**
+ * Load one bundled demo entry from `demo/index.json`.
+ *
+ * Single-image demos load `demo/<filename>` with a sibling settings file. Folder demos (for example
+ * `11_per_frame`) load every image listed in `demo/<id>/manifest.json` together with that folder's
+ * settings file.
+ *
+ * @param {string} demoId
+ * @returns {Promise<void>}
+ */
+async function loadSelectedDemo(demoId) {
+  const folderManifestUrl = `demo/${demoId}/manifest.json`;
+  try {
+    const response = await fetch(folderManifestUrl, { cache: "no-store" });
+    if (response.ok) {
+      const manifest = await response.json();
+      if (manifest?.type === "per-frame" && Array.isArray(manifest.images) && manifest.images.length > 0) {
+        await loadPerFrameFolderDemo(demoId, manifest);
+        return;
+      }
+    }
+  } catch {
+    // Fall through to the single-image demo path.
+  }
+  await loadImageSource(`demo/${demoId}`, demoId);
+}
+
+/**
+ * Load a bundled per-frame demo folder: all manifest images plus the folder settings file.
+ *
+ * @param {string} demoId
+ * @param {{ settings?: string, images: string[] }} manifest
+ * @returns {Promise<void>}
+ */
+async function loadPerFrameFolderDemo(demoId, manifest) {
+  const baseUrl = new URL(`demo/${demoId}/`, globalThis.location?.href || window.location.href);
+  const settingsName = manifest.settings || `${demoId}_settings.txt`;
+  let companionSettingsText = "";
+  try {
+    const settingsResponse = await fetch(new URL(settingsName, baseUrl).toString(), { cache: "no-store" });
+    if (settingsResponse.ok) {
+      companionSettingsText = await settingsResponse.text();
+    }
+  } catch {
+    /* settings are optional */
+  }
+  const imageNames = manifest.images.filter((name) => typeof name === "string" && name.trim());
+  const [firstImageName, ...restImageNames] = imageNames;
+  if (!firstImageName) return;
+  const additionalImageSources = restImageNames.map((name) => ({
+    src: new URL(name, baseUrl).toString(),
+    filename: name,
+    mimeType: guessImageMimeType(name),
+  }));
+  await loadImageSource(
+    new URL(firstImageName, baseUrl).toString(),
+    firstImageName,
+    guessImageMimeType(firstImageName),
+    null,
+    [],
+    { companionSettingsText, additionalImageSources, demoId },
+  );
 }
 
 /**
@@ -251,13 +310,15 @@ function maybeLoadStartupDemoFromUrl(manifestFilenames) {
  * continuing to advertise the old demo after the user switches to another file or demo.
  *
  * @param {string} nextFilename
+ * @param {string} [demoId=""]
  * @returns {void}
  */
-function clearDemoQueryIfLoadingDifferentFile(nextFilename) {
+function clearDemoQueryIfLoadingDifferentFile(nextFilename, demoId = "") {
   const url = new URL(globalThis.location?.href || "", globalThis.location?.href || window.location.href);
   const currentDemo = String(url.searchParams.get("demo") || "").trim();
   if (!currentDemo) return;
-  if (currentDemo === String(nextFilename || "").trim()) return;
+  const nextDemoId = String(demoId || "").trim();
+  if (currentDemo === nextDemoId || currentDemo === String(nextFilename || "").trim()) return;
   url.searchParams.delete("demo");
   history.replaceState(null, "", url.toString());
   if (dom.loadDemoSelect) {
@@ -1929,6 +1990,11 @@ function init() {
   attachResizeHandler();
   startAnimationPreviewLoop();
   void initializeMp4Support();
+
+  // Until the Phase 7 image strip exists, expose the active-image switch on a small dev handle so
+  // per-frame per-image overrides can be exercised from the console. Phase 7 will call setActiveImage
+  // directly from the strip wiring.
+  window.plottimation = Object.assign(window.plottimation || {}, { setActiveImage });
 }
 
 /**
@@ -1946,7 +2012,7 @@ function attachUi() {
     makeLivePreviewDragCue,
     makeGifImageDraggable,
     handleFile,
-    loadSelectedDemo: (filename) => { void loadImageSource(`demo/${filename}`, filename); },
+    loadSelectedDemo: (filename) => { void loadSelectedDemo(filename); },
     renderRectifiedPreview,
     resetAppearanceControls,
     resetTrimControls,
@@ -2022,6 +2088,11 @@ function attachUi() {
     beginPostRotationScrub,
     endPostRotationScrub,
     finishPostRotationScrubIfUnchanged,
+    commitActivePostRotationFromSlider,
+    setActiveImage,
+    isPerFrameModeActive,
+    addPerFrameImages,
+    clearAllPreviews,
     bumpFrameOutputEpoch,
     setGeometryProcessingCursor,
     cancelInFlightProcessing,
@@ -2084,7 +2155,9 @@ async function initializeMp4Support() {
  */
 function applyManualMarkerOverrides(alignmentInfo) {
   if (!alignmentInfo) return;
-  if (readConfig().alignmentPipeline === "markerless") return;
+  // Non-marker pipelines (markerless + per-frame) interpret corner overrides as post-stabilization
+  // nudges, not in-place marker patches, so this marker-only fast path is skipped for both.
+  if (readConfig().alignmentPipeline !== "markers") return;
   for (const [key, override] of state.geometry.manualMarkerOverrides.entries()) {
     const marker = alignmentInfo.markerLookup.get(key);
     const tile = alignmentInfo.crossRoiTileMap?.get(key);
@@ -2205,11 +2278,7 @@ function resetTrimControls() {
  */
 function resetExportControls() {
   const previousOutputSize = getRequestedOutputSize();
-  const maxFrameCount = Math.max(
-    1,
-    Math.max(1, Math.round(Number(dom.frameCols.value) || SETTINGS_DEFAULTS.layout.frameCols)) *
-    Math.max(1, Math.round(Number(dom.frameRows.value) || SETTINGS_DEFAULTS.layout.frameRows))
-  );
+  const maxFrameCount = getFrameExportCountMax();
   const alreadyReset =
     (Number(dom.fps.value) || SETTINGS_DEFAULTS.gifExport.fps) === SETTINGS_DEFAULTS.gifExport.fps &&
     (Number(dom.loopCount.value) || SETTINGS_DEFAULTS.gifExport.loopCount) === SETTINGS_DEFAULTS.gifExport.loopCount &&
@@ -2265,6 +2334,9 @@ function resetExportControls() {
  */
 function resetNonLayoutControls() {
   applyNonLayoutDefaults(dom);
+  // `applyNonLayoutDefaults` restores the pipeline radio to the default ("markers"); clear the
+  // legacy per-frame force shim too so `isPerFrameModeActive()` agrees with the reset radio.
+  state.runtime.forcePerFrameMode = false;
   state.geometry.manualMarkerOverrides.clear();
   state.preview.activeEditedMarker = null;
   state.runtime.markerEditingEnabled = false;
@@ -2385,7 +2457,8 @@ function scheduleStabilizationPreviewUpdate() {
  * @returns {void}
  */
 function beginStabilizationStrengthScrub() {
-  if (readConfig().alignmentPipeline === "markerless") {
+  // Stabilization is available in markerless and per-frame; warm the solver for both non-marker modes.
+  if (readConfig().alignmentPipeline !== "markers") {
     scheduleCurrentStabilizationWarmup();
   }
   if (state.preview.stabilizationStrengthScrubbing) return;
@@ -2526,6 +2599,38 @@ function finishPostRotationScrubIfUnchanged() {
   }
   drawCurrentGifPreview();
   return true;
+}
+
+/**
+ * Read the Post-Rotation slider value, clamped to the slider's range.
+ *
+ * @returns {number}
+ */
+function readPostRotationSliderDeg() {
+  return Math.max(
+    -1.1,
+    Math.min(
+      1.1,
+      Number.isFinite(Number(dom.postRotation?.value))
+        ? Number(dom.postRotation.value)
+        : SETTINGS_DEFAULTS.detection.postRotationDeg
+    )
+  );
+}
+
+/**
+ * Persist the current Post-Rotation slider value onto the active per-frame image entry.
+ *
+ * In per-frame mode each image carries its own Post-Rotation; the global slider edits the active
+ * image's value so reprocessing rectifies that image with its own rotation. In markers / markerless
+ * mode this is a no-op (Post-Rotation stays a single global value read from `config.postRotationDeg`),
+ * so legacy behavior is unchanged.
+ *
+ * @returns {void}
+ */
+function commitActivePostRotationFromSlider() {
+  if (!isPerFrameModeActive()) return;
+  setActivePostRotationDeg(state, readPostRotationSliderDeg(), true);
 }
 
 /**
@@ -2822,15 +2927,32 @@ async function handleFile(file, files = null) {
  * @param {string} src
  * @param {string} [filename=""]
  * @param {string} [mimeType="image/jpeg"]
+ * @param {File | null} [settingsFile=null]
+ * @param {File[]} [additionalImageFiles=[]] Extra images beyond the primary, loaded as per-frame entries.
+ * @param {{
+ *   companionSettingsText?: string | null,
+ *   additionalImageSources?: { src: string, filename?: string, mimeType?: string }[],
+ *   demoId?: string,
+ * }} [options={}]
  * @returns {Promise<void>}
  */
-async function loadImageSource(src, filename = "", mimeType = "image/jpeg", settingsFile = null) {
-  clearDemoQueryIfLoadingDifferentFile(filename);
+async function loadImageSource(
+  src,
+  filename = "",
+  mimeType = "image/jpeg",
+  settingsFile = null,
+  additionalImageFiles = [],
+  options = {},
+) {
+  clearDemoQueryIfLoadingDifferentFile(filename, options.demoId || "");
   await loadImageSourceViaController({
     src,
     filename,
     mimeType,
     settingsFile,
+    additionalImageFiles,
+    additionalImageSources: options.additionalImageSources || [],
+    companionSettingsText: options.companionSettingsText ?? null,
     dom,
     state,
     setStatus,
@@ -2849,6 +2971,10 @@ async function loadImageSource(src, filename = "", mimeType = "image/jpeg", sett
     invalidateAppearanceCache,
     processCurrentImage,
     drawImageToCanvas,
+    // After a per-frame settings restore reattaches buffered per-image overrides, refresh the active
+    // entry's legacy field + Post-Rotation slider + Page Corners overlay + strip so the editor reflects
+    // the restored values (no-op for single-image markers/markerless loads).
+    refreshActiveImage: setActiveImage,
   });
 }
 
@@ -2870,6 +2996,112 @@ function scheduleProcess(delayMs = 220) {
   state.processing.timer = window.setTimeout(() => {
     void processCurrentImage(requestId);
   }, Math.max(0, delayMs));
+}
+
+/**
+ * Decode and append additional images as per-frame entries, then reprocess with the new frame count.
+ *
+ * Reuses the Phase 4 decode path (`decodeImageElement`) so the strip's `+` tile and additional drops
+ * share one code path. Each new entry owns its own blob URL + source-resolution canvas. If the strip
+ * was empty (e.g. after deleting every image), the first added entry becomes the active image and the
+ * legacy projections are repointed at it via `setActiveImage`. Forces per-frame mode on so adding
+ * images never silently changes pipelines.
+ *
+ * @param {File[]} files
+ * @returns {Promise<void>}
+ */
+async function addPerFrameImages(files) {
+  const imageFiles = (files || []).filter((file) => file && String(file.type || "").startsWith("image/"));
+  if (imageFiles.length === 0) return;
+
+  setGeometryProcessingCursor(true);
+  const startedEmpty = !Array.isArray(state.source.images) || state.source.images.length === 0;
+  if (!Array.isArray(state.source.images)) state.source.images = [];
+
+  let addedAny = false;
+  for (const file of imageFiles) {
+    const url = URL.createObjectURL(file);
+    let image;
+    try {
+      image = await decodeImageElement(url);
+    } catch {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        /* already revoked */
+      }
+      continue;
+    }
+    const canvas = document.createElement("canvas");
+    drawImageToCanvas(image, canvas);
+    state.source.images.push(
+      createSourceImageEntry({
+        image,
+        filename: file.name || "",
+        mimeType: file.type || "image/jpeg",
+        ownedObjectUrl: url,
+        dragUrl: url,
+        canvas,
+      }),
+    );
+    addedAny = true;
+  }
+  if (!addedAny) {
+    setGeometryProcessingCursor(false);
+    return;
+  }
+
+  // Adding images is an explicit per-frame action; make sure the pipeline is in per-frame mode.
+  state.runtime.forcePerFrameMode = true;
+  if (dom.alignmentPipelinePerFrame) dom.alignmentPipelinePerFrame.checked = true;
+  document.body.classList.add("has-loaded-image");
+
+  // If a per-frame settings file was loaded before any images (the reload story), reattach its
+  // buffered per-image overrides by upload order to the now-present images, then consume the buffer.
+  applyPendingPerImageOverrides(state);
+
+  if (startedEmpty) {
+    // No active image existed (fresh or fully-emptied strip): adopt the first new entry as active and
+    // repoint the legacy projections so processCurrentImage has a source image to read.
+    setActiveImage(0);
+  }
+  syncAlignmentMarkerUi();
+  renderPerFrameStrip();
+  updateSliderReadouts();
+  scheduleProcess(0);
+}
+
+/**
+ * Report whether the per-frame alignment pipeline is currently active.
+ *
+ * Per-frame mode is selected by its own radio (added in Phase 6) or, until then, by a dev/multi-file
+ * flag (`state.runtime.forcePerFrameMode`). The radio ref is read with optional chaining so this is
+ * forward-compatible with Phase 6 wiring `dom.alignmentPipelinePerFrame`. This matches the detection
+ * `readConfig` uses, so per-image override routing and the active config stay consistent.
+ *
+ * @returns {boolean}
+ */
+function isPerFrameModeActive() {
+  return !!dom.alignmentPipelinePerFrame?.checked || !!state.runtime.forcePerFrameMode;
+}
+
+/**
+ * Upper bound for the `Frames in Export` control and the export-options clamp.
+ *
+ * Grid pipelines cap at Frame Columns × Frame Rows. Per-frame mode caps at the number of uploaded
+ * images (or extracted frames once processing has run).
+ *
+ * @returns {number}
+ */
+function getFrameExportCountMax() {
+  if (isPerFrameModeActive()) {
+    const imageCount = Array.isArray(state.source.images) ? state.source.images.length : 0;
+    const frameBudget = imageCount > 0 ? imageCount : Math.max(0, state.geometry.frameCount || 0);
+    return Math.max(1, frameBudget);
+  }
+  const cols = Math.max(1, Math.min(20, Math.round(Number(dom.frameCols.value) || SETTINGS_DEFAULTS.layout.frameCols)));
+  const rows = Math.max(1, Math.min(20, Math.round(Number(dom.frameRows.value) || SETTINGS_DEFAULTS.layout.frameRows)));
+  return Math.max(1, cols * rows);
 }
 
 /**
@@ -2940,7 +3172,10 @@ function readConfig() {
   const paperAspect = clampPaperAspect(paperWidth, paperHeight);
   const frameCols = Math.max(1, Math.min(20, Math.round(Number(dom.frameCols.value) || SETTINGS_DEFAULTS.layout.frameCols)));
   const frameRows = Math.max(1, Math.min(20, Math.round(Number(dom.frameRows.value) || SETTINGS_DEFAULTS.layout.frameRows)));
-  const sourceFrameCount = Math.max(1, frameCols * frameRows);
+  const sourceFrameCount = getFrameExportCountMax();
+  // Per-frame mode is selected by its own radio (added in Phase 6) or, until then, by a dev flag so
+  // the pipeline can be exercised before the UI exists. See isPerFrameModeActive for details.
+  const perFrameModeActive = isPerFrameModeActive();
   const encodingQuality = getEncodingQualityValue();
   const readSearchInset = (input, fallback) => Math.max(
     0,
@@ -2978,7 +3213,11 @@ function readConfig() {
           : SETTINGS_DEFAULTS.detection.postRotationDeg
       )
     ),
-    alignmentPipeline: dom.alignmentPipelineMarkerless.checked ? "markerless" : "markers",
+    alignmentPipeline: perFrameModeActive
+      ? "per-frame"
+      : dom.alignmentPipelineMarkerless.checked
+      ? "markerless"
+      : "markers",
     // The radio group exposes a temporary-friendly UI label, but the config keeps stable internal
     // ids so settings files and solver branching do not depend on user-facing wording.
     stabilizationMethod: dom.stabilizationMethodAverage?.checked ? "difference-from-average" : "pairwise-cyclic",
@@ -3011,7 +3250,11 @@ function readConfig() {
     markerlessUseVariance: dom.markerlessUseVariance ? dom.markerlessUseVariance.checked : true,
     lightOnDarkDesign: dom.lightOnDarkDesign ? dom.lightOnDarkDesign.checked : false,
     detectCrossesWithConvolution: (dom.alignmentPipelineMarkers.checked && dom.alignmentMarkerType.value === "crosses") && dom.detectCrossesWithConvolution.checked,
-    useCrossAlignment: dom.alignmentPipelineMarkerless.checked ? true : dom.useCrossAlignment.checked,
+    useCrossAlignment: perFrameModeActive
+      ? false
+      : dom.alignmentPipelineMarkerless.checked
+      ? true
+      : dom.useCrossAlignment.checked,
     useRectifiedAsSource: false,
     crop: {
       left: Math.max(0, Math.round(Number(dom.cropLeft.value) || 0)),
@@ -3189,13 +3432,14 @@ function syncPaperPresetUi() {
 }
 
 function getActiveAlignmentPipeline() {
+  if (isPerFrameModeActive()) return "per-frame";
   return dom.alignmentPipelineMarkerless.checked ? "markerless" : "markers";
 }
 
 /**
  * Preserve the markerless default of zero Grid Search Inset X/Y when switching away from marker mode.
  *
- * @param {"markerless"|"markers"} pipeline
+ * @param {"markerless"|"markers"|"per-frame"} pipeline
  * @returns {void}
  */
 function applyAlignmentPipelineDefaults(pipeline) {
@@ -3215,7 +3459,7 @@ function applyAlignmentPipelineDefaults(pipeline) {
 /**
  * Ensure marker-pipeline-only controls hold a valid state before being shown again.
  *
- * @param {"markerless"|"markers"} pipeline
+ * @param {"markerless"|"markers"|"per-frame"} pipeline
  * @returns {void}
  */
 function sanitizeAlignmentPipelineState(pipeline) {
@@ -3232,31 +3476,48 @@ function sanitizeAlignmentPipelineState(pipeline) {
 /**
  * Return which alignment-specific control groups should be visible for the active pipeline.
  *
- * @param {"markerless"|"markers"} pipeline
- * @returns {{showMarkerlessControls:boolean,showMarkersPipelineControls:boolean,showCrossOnlyControls:boolean}}
+ * `showMarkerlessControls` stays strictly markerless-only (markerless gutter/phase/working-image
+ * diagnostics must not leak into per-frame mode). `showFrameCornerControls` is the broader
+ * "non-marker" family (markerless + per-frame) that shares stabilization, drift compensation and the
+ * Frame Corners override editor. `isPerFrame` lets callers hide markerless-only controls that the
+ * non-marker family would otherwise reveal (e.g. gutter sliders, Grid Edge controls).
+ *
+ * @param {"markerless"|"markers"|"per-frame"} pipeline
+ * @returns {{showMarkerlessControls:boolean,showMarkersPipelineControls:boolean,showCrossOnlyControls:boolean,showFrameCornerControls:boolean,isPerFrame:boolean}}
  */
 function getAlignmentUiModeFlags(pipeline) {
   document.body.classList.toggle("markerless-pipeline", pipeline === "markerless");
+  document.body.classList.toggle("per-frame-pipeline", pipeline === "per-frame");
   const markerType = dom.alignmentMarkerType.value || SETTINGS_DEFAULTS.detection.alignmentMarkerType;
   const resolvedAutoType = state.geometry.alignmentInfo?.resolvedMarkerType || null;
   const showMarkersPipelineControls = pipeline === "markers";
   const showCrossOnlyControls = showMarkersPipelineControls && (markerType === "crosses" || (markerType === "auto" && resolvedAutoType === "crosses"));
   const showMarkerlessControls = pipeline === "markerless";
+  const isPerFrame = pipeline === "per-frame";
+  const showFrameCornerControls = pipeline !== "markers";
   return {
     showMarkerlessControls,
     showMarkersPipelineControls,
     showCrossOnlyControls,
+    showFrameCornerControls,
+    isPerFrame,
   };
 }
 
 /**
  * Rewrite alignment-related labels so the UI language matches the active pipeline.
  *
- * @param {{showMarkerlessControls:boolean}} flags
+ * Per-frame mode shares the corner/stabilization mental model with markerless mode, so the
+ * non-marker label family (`showFrameCornerControls`) drives the Frame Corners heading, the
+ * stabilize/centers viewer tabs and the ROI-size label. `showMarkerlessControls` is reserved for
+ * the markerless-only "summaryMarkerless" copy that mentions gutter fitting, which does not apply
+ * to per-frame's synthetic exact grid.
+ *
+ * @param {{showMarkerlessControls:boolean,showFrameCornerControls:boolean,isPerFrame:boolean}} flags
  * @returns {void}
  */
 function syncAlignmentPipelineLabels(flags) {
-  const { showMarkerlessControls } = flags;
+  const { showMarkerlessControls, showFrameCornerControls, isPerFrame } = flags;
   const frameAlignmentSummary = document.querySelector("#frameAlignmentSummary");
   const frameAlignmentSummaryLabel =
     frameAlignmentSummary?.querySelector("[data-i18n='alignment.summary']") ||
@@ -3266,26 +3527,26 @@ function syncAlignmentPipelineLabels(flags) {
     frameAlignmentSummaryLabel.textContent = showMarkerlessControls ? t("alignment.summaryMarkerless") : t("alignment.summary");
   }
   if (dropGuidanceNote) {
-    dropGuidanceNote.textContent = t("photo.dropNote");
+    dropGuidanceNote.textContent = isPerFrame ? t("photo.dropNotePerFrame") : t("photo.dropNote");
   }
   const isMobileViewerMode = state.runtime.mobileSingleViewerMode;
   const headingText = isMobileViewerMode
-    ? t(showMarkerlessControls ? "viewerTabs.centers" : "viewerTabs.markers")
-    : t(showMarkerlessControls ? "panels.frameCorners" : "panels.frameAlignmentMarkers");
+    ? t(showFrameCornerControls ? "viewerTabs.centers" : "viewerTabs.markers")
+    : t(showFrameCornerControls ? "panels.frameCorners" : "panels.frameAlignmentMarkers");
   if (dom.crossRegionsHeading) {
     const label = dom.crossRegionsHeading.querySelector("[data-panel-heading]") || dom.crossRegionsHeading.firstElementChild;
     if (label) label.textContent = headingText;
   }
   if (dom.viewerTabMarkers) {
-    const viewerTabKey = showMarkerlessControls ? "viewerTabs.centers" : "viewerTabs.markers";
+    const viewerTabKey = showFrameCornerControls ? "viewerTabs.centers" : "viewerTabs.markers";
     dom.viewerTabMarkers.textContent = t(viewerTabKey);
   }
   if (dom.mobileControlTabAlignment) {
-    const mobileControlTabKey = showMarkerlessControls ? "mobileControlTabs.stabilize" : "mobileControlTabs.markers";
+    const mobileControlTabKey = showFrameCornerControls ? "mobileControlTabs.stabilize" : "mobileControlTabs.markers";
     dom.mobileControlTabAlignment.textContent = t(mobileControlTabKey);
   }
   if (dom.crossRoiScaleLabel) {
-    dom.crossRoiScaleLabel.textContent = showMarkerlessControls
+    dom.crossRoiScaleLabel.textContent = showFrameCornerControls
       ? t("alignment.frameCornerRoiSize")
       : t("alignment.roiSize");
   }
@@ -3301,17 +3562,17 @@ function syncAlignmentPipelineLabels(flags) {
   if (markerlessPhaseYLabel) {
     markerlessPhaseYLabel.textContent = t("alignment.markerlessPhaseYOffset");
   }
-  syncAlignmentModeTooltips(showMarkerlessControls);
+  syncAlignmentModeTooltips(showFrameCornerControls);
 }
 
 /**
  * Keep shared tooltip text aligned with the active pipeline when marker terminology becomes
- * corner/stabilization terminology in markerless mode.
+ * corner/stabilization terminology in the non-marker (markerless / per-frame) pipelines.
  *
- * @param {boolean} showMarkerlessControls
+ * @param {boolean} showFrameCornerControls
  * @returns {void}
  */
-function syncAlignmentModeTooltips(showMarkerlessControls) {
+function syncAlignmentModeTooltips(showFrameCornerControls) {
   const applyTooltip = (element, key, extraElements = []) => {
     if (!element) return;
     const text = t(`tooltip.${key}`);
@@ -3332,37 +3593,40 @@ function syncAlignmentModeTooltips(showMarkerlessControls) {
 
   applyTooltip(
     document.querySelector("#frameAlignmentSummary"),
-    showMarkerlessControls ? "frameAlignmentSummaryMarkerless" : "frameAlignmentSummary",
+    showFrameCornerControls ? "frameAlignmentSummaryMarkerless" : "frameAlignmentSummary",
   );
   applyTooltip(
     dom.crossRegionsHeading,
-    showMarkerlessControls ? "crossRegionsHeadingMarkerless" : "crossRegionsHeading",
+    showFrameCornerControls ? "crossRegionsHeadingMarkerless" : "crossRegionsHeading",
   );
   applyTooltip(
     dom.crossRoiScale,
-    showMarkerlessControls ? "crossRoiScaleMarkerless" : "crossRoiScale",
+    showFrameCornerControls ? "crossRoiScaleMarkerless" : "crossRoiScale",
     [dom.crossRoiScale?.closest("label")],
   );
   applyTooltip(
     dom.toggleMarkerEditingButton,
-    showMarkerlessControls ? "toggleMarkerEditingButtonMarkerless" : "toggleMarkerEditingButton",
+    showFrameCornerControls ? "toggleMarkerEditingButtonMarkerless" : "toggleMarkerEditingButton",
   );
   applyTooltip(
     dom.clearMarkerEditsButton,
-    showMarkerlessControls ? "clearMarkerEditsButtonMarkerless" : "clearMarkerEditsButton",
+    showFrameCornerControls ? "clearMarkerEditsButtonMarkerless" : "clearMarkerEditsButton",
   );
 }
 
 /**
  * Keep the shared ROI-size slider in the right position for the active alignment mode.
  *
- * @param {{showMarkerlessControls:boolean}} flags
+ * Per-frame mode shares the markerless Frame Corners layout, so the corner ROI slider sits at the
+ * bottom of the stack for both non-marker pipelines.
+ *
+ * @param {{showFrameCornerControls:boolean}} flags
  * @returns {void}
  */
 function syncAlignmentSliderOrder(flags) {
-  const { showMarkerlessControls } = flags;
+  const { showFrameCornerControls } = flags;
   if (dom.alignmentSliderStack && dom.crossRoiScaleRow) {
-    if (showMarkerlessControls) {
+    if (showFrameCornerControls) {
       dom.alignmentSliderStack.appendChild(dom.crossRoiScaleRow);
     } else {
       dom.alignmentSliderStack.prepend(dom.crossRoiScaleRow);
@@ -3373,27 +3637,38 @@ function syncAlignmentSliderOrder(flags) {
 /**
  * Show or hide the alignment controls appropriate for the active pipeline.
  *
- * @param {{showMarkerlessControls:boolean,showMarkersPipelineControls:boolean,showCrossOnlyControls:boolean}} flags
+ * Three control families:
+ * - Stabilization + Vertical Drift Compensation are the shared non-marker family
+ *   (`showFrameCornerControls`): visible in markerless AND per-frame.
+ * - Grid Edge Threshold / Run Length are marker-only grid controls: shown only in markers
+ *   (`showMarkersPipelineControls`), so they are hidden in BOTH markerless and per-frame.
+ * - Markerless gutter/phase sliders (`markerlessPhase*Row`) stay markerless-only
+ *   (`showMarkerlessControls`): hidden in per-frame because the synthetic grid needs no phase sweep.
+ *
+ * @param {{showMarkerlessControls:boolean,showMarkersPipelineControls:boolean,showCrossOnlyControls:boolean,showFrameCornerControls:boolean}} flags
  * @returns {void}
  */
 function syncAlignmentPipelineVisibility(flags) {
-  const { showMarkerlessControls, showMarkersPipelineControls, showCrossOnlyControls } = flags;
-  dom.boundarySensitivityRow.hidden = showMarkerlessControls;
-  dom.boundaryPersistenceRow.hidden = showMarkerlessControls;
+  const { showMarkerlessControls, showMarkersPipelineControls, showCrossOnlyControls, showFrameCornerControls } = flags;
+  // Grid Edge Threshold / Run Length are marker-grid controls: keep visible only in markers mode so
+  // per-frame (which has no detected grid edges) hides them alongside markerless.
+  dom.boundarySensitivityRow.hidden = !showMarkersPipelineControls;
+  dom.boundaryPersistenceRow.hidden = !showMarkersPipelineControls;
   if (dom.stabilizationMethodGroup) {
-    dom.stabilizationMethodGroup.hidden = !showMarkerlessControls;
+    dom.stabilizationMethodGroup.hidden = !showFrameCornerControls;
   }
   if (dom.stabilizationEnabledRow) {
-    dom.stabilizationEnabledRow.hidden = !showMarkerlessControls;
+    dom.stabilizationEnabledRow.hidden = !showFrameCornerControls;
   }
   if (dom.stabilizationStrengthRow) {
-    dom.stabilizationStrengthRow.hidden = !showMarkerlessControls;
+    dom.stabilizationStrengthRow.hidden = !showFrameCornerControls;
   }
   dom.alignmentMarkerTypeField.hidden = !showMarkersPipelineControls;
   // Keep marker subpixel alignment as a settings-file/default option, not a visible UI control.
   dom.useCrossAlignmentRow.hidden = true;
   dom.detectCrossesWithConvolutionRow.hidden = !showCrossOnlyControls;
-  dom.stabilizationLambdaRow.hidden = !showMarkerlessControls;
+  dom.stabilizationLambdaRow.hidden = !showFrameCornerControls;
+  // Markerless gutter/phase sweep sliders remain markerless-only; per-frame's exact grid skips them.
   dom.markerlessPhaseXRow.hidden = !showMarkerlessControls;
   dom.markerlessPhaseYRow.hidden = !showMarkerlessControls;
   if (dom.markerlessPhaseDebugRow) {
@@ -3408,23 +3683,24 @@ function syncAlignmentPipelineVisibility(flags) {
   if (dom.markerlessUseVarianceRow) {
     dom.markerlessUseVarianceRow.hidden = true;
   }
-  dom.verticalDriftCompensationRow.hidden = !showMarkerlessControls;
+  dom.verticalDriftCompensationRow.hidden = !showFrameCornerControls;
 }
 
 /**
- * Enable only the stabilization controls that apply to the current markerless method.
+ * Enable only the stabilization controls that apply to the current method.
  *
  * `Stabilization Rigidity` (`lambda`) only affects the pairwise/cyclic least-squares solve. The
  * alternate average-reference method does not use it, so the slider should be visibly inactive in
- * that mode to avoid implying that it has any effect.
+ * that mode to avoid implying that it has any effect. Per-frame mode runs the same stabilization
+ * solver as markerless, so it shares this gating via `showFrameCornerControls`.
  *
- * @param {{showMarkerlessControls:boolean}} flags
+ * @param {{showFrameCornerControls:boolean}} flags
  * @returns {void}
  */
 function syncStabilizationMethodUi(flags) {
-  const { showMarkerlessControls } = flags;
+  const { showFrameCornerControls } = flags;
   const usesLambda =
-    showMarkerlessControls &&
+    showFrameCornerControls &&
     (dom.stabilizationMethodPairwise?.checked || !dom.stabilizationMethodAverage?.checked);
   if (dom.stabilizationLambda) {
     dom.stabilizationLambda.disabled = !usesLambda;
@@ -3490,6 +3766,9 @@ function syncAlignmentMarkerUi() {
     }
   }
   syncMarkerlessPhaseDebugUi();
+  // Keep the per-frame strip's visibility + thumbnails in sync with the active pipeline. Idempotent:
+  // hides/empties the strip in markers/markerless modes and only rebuilds on real image[] changes.
+  renderPerFrameStrip();
 }
 
 /**
@@ -3548,7 +3827,9 @@ function togglePageCornerEditing() {
  */
 function clearPageCornerEdits() {
   if (!Array.isArray(state.source.manualPageContour) || state.source.manualPageContour.length !== 4) return;
-  state.source.manualPageContour = null;
+  // Clearing the override drops it from the active image entry too in per-frame mode (legacy-only
+  // otherwise). Subsequent reprocessing re-detects this image's page automatically.
+  setActiveManualPageContour(state, null, isPerFrameModeActive());
   state.preview.activePageCornerDrag = null;
   state.runtime.pageCornerEditingEnabled = false;
   cancelPageCornerOverrideDependentWork();
@@ -3632,8 +3913,10 @@ function clearMarkerEdits() {
   state.geometry.manualMarkerOverrides.clear();
   state.preview.activeEditedMarker = null;
   state.runtime.markerEditingEnabled = false;
-  const isMarkerless = readConfig().alignmentPipeline === "markerless";
-  if (state.geometry.alignmentInfo && !isMarkerless) {
+  // Non-marker pipelines (markerless + per-frame) store overrides as corner nudges, so they take the
+  // same cache-clearing revert path; only true marker mode patches the live marker objects in place.
+  const usesCornerNudges = readConfig().alignmentPipeline !== "markers";
+  if (state.geometry.alignmentInfo && !usesCornerNudges) {
     // Original auto-detected positions are cached on the live alignment objects so edits can revert instantly
     // without rerunning the whole detector.
     for (const [key, marker] of state.geometry.alignmentInfo.markerLookup.entries()) {
@@ -3651,7 +3934,7 @@ function clearMarkerEdits() {
     }
   }
   revokeGifUrl();
-  if (isMarkerless) {
+  if (usesCornerNudges) {
     state.frames.base = new Array(state.geometry.frameCount);
     state.frames.baseOutputEpoch = new Array(state.geometry.frameCount);
     state.frames.stabilizedCache.clear();
@@ -3746,9 +4029,7 @@ function updateSliderReadouts() {
   if (!frameCountFieldFocused) {
     syncFrameCountToExportUi();
   } else if (dom.frameCountToExport) {
-    const cols = Math.max(1, Math.min(20, Math.round(Number(dom.frameCols.value) || SETTINGS_DEFAULTS.layout.frameCols)));
-    const rows = Math.max(1, Math.min(20, Math.round(Number(dom.frameRows.value) || SETTINGS_DEFAULTS.layout.frameRows)));
-    const maxFrameCount = Math.max(1, cols * rows);
+    const maxFrameCount = getFrameExportCountMax();
     dom.frameCountToExport.min = "1";
     dom.frameCountToExport.max = String(maxFrameCount);
     state.runtime.lastFrameExportCountMax = maxFrameCount;
@@ -3828,7 +4109,7 @@ function updateSliderReadouts() {
     return;
   }
   const config = readConfig();
-  const roiSizePx = config.alignmentPipeline === "markerless"
+  const roiSizePx = config.alignmentPipeline !== "markers"
     ? estimateMarkerlessCornerTileSidePx(
         state.geometry.alignmentInfo.rectifiedWidth,
         state.geometry.alignmentInfo.rectifiedHeight,
@@ -3851,19 +4132,18 @@ function updateSliderReadouts() {
 }
 
 /**
- * Clamp the export-frame-count control to the current grid size. If the control was still at the
- * previous maximum, treat it as "use all cells" and advance it to the new maximum automatically.
+ * Clamp the export-frame-count control to the current source budget (grid cells or per-frame images).
+ * If the control was still at the previous maximum, treat it as "use all frames" and advance it to
+ * the new maximum automatically.
  *
  * This also covers legacy settings files that predate `Frames in Export`: an empty field is
- * interpreted as "export the whole grid", not as a literal zero or one-frame request.
+ * interpreted as "export every available frame", not as a literal zero or one-frame request.
  *
  * @returns {number}
  */
 function syncFrameCountToExportUi() {
   if (!dom.frameCountToExport) return 0;
-  const cols = Math.max(1, Math.min(20, Math.round(Number(dom.frameCols.value) || SETTINGS_DEFAULTS.layout.frameCols)));
-  const rows = Math.max(1, Math.min(20, Math.round(Number(dom.frameRows.value) || SETTINGS_DEFAULTS.layout.frameRows)));
-  const maxFrameCount = Math.max(1, cols * rows);
+  const maxFrameCount = getFrameExportCountMax();
   const previousMax = Math.max(1, state.runtime.lastFrameExportCountMax || maxFrameCount);
   const rawText = String(dom.frameCountToExport.value || "").trim();
   const rawValue = Number(rawText);
@@ -4162,7 +4442,7 @@ async function processCurrentImage(requestId = state.processing.requestId) {
 
   try {
     const config = timeProfiled("readConfig", () => readConfig());
-    const result = timeProfiled("runPipeline", () => runPipeline(state.source.canvas, config, requestId, throwIfProcessAborted));
+    const result = timeProfiled("runPipeline", () => runPipeline(state.source.canvas, config, requestId, throwIfProcessAborted, state.source.images));
     if (requestId !== state.processing.requestId) {
       finishTimingProfile(timingProfile);
       return;
@@ -4237,7 +4517,8 @@ async function processCurrentImage(requestId = state.processing.requestId) {
     updatePageGridDetectionHeading(false);
     setStatus(buildStatusWithTiming(result.statusText));
     schedulePreviewFrameWarmup(requestId);
-    if (config.alignmentPipeline === "markerless") {
+    // Stabilization runs in both non-marker pipelines, so warm its solver after per-frame too.
+    if (config.alignmentPipeline !== "markers") {
       scheduleMarkerlessStabilizationWarmup(requestId);
     }
   } catch (error) {
@@ -4774,7 +5055,9 @@ function getPreviewFrameQuadForSourceIndex(sourceIndex) {
   const row = Math.floor(sourceIndex / cols);
   if (row < 0 || row >= alignmentInfo.rows) return null;
   const extractionInfo =
-    readConfig().alignmentPipeline === "markerless"
+    // Per-frame uses the same corner-cross lattice as markerless, so resolve preview frame quads
+    // through the markerless extraction builder for both non-marker pipelines.
+    readConfig().alignmentPipeline !== "markers"
       ? buildMarkerlessExtractionInfoForFrame(alignmentInfo, col, row)
       : alignmentInfo;
   const quad = resolveFrameQuadForPreview(extractionInfo, col, row);
@@ -4859,7 +5142,8 @@ function drawOmittedFrameQuads(ctx, mapRectifiedPointToPreview) {
  */
 function resolveDisplayedAlignmentPoint(alignmentInfo, col, row) {
   const key = getMarkerKey(col, row);
-  if (readConfig().alignmentPipeline === "markerless") {
+  // Per-frame shares the markerless corner-display model (phase + stabilization + manual nudge).
+  if (readConfig().alignmentPipeline !== "markers") {
     const sourceMarker = alignmentInfo?.markerLookup?.get(key);
     if (sourceMarker) {
       const displayed = getMarkerlessDisplayedCorner(sourceMarker, col, row, alignmentInfo);
@@ -5047,7 +5331,30 @@ function trimCachesBeforeReprocess() {
   state.frames.stabilizationOffsets = null;
   state.frames.adjustedCache.clear();
   state.frames.adjustedOutputEpoch.clear();
+  trimInactivePerFrameRectifiedCaches();
   syncRectifiedSheetHeadingLink();
+}
+
+/**
+ * Free per-image rectified Mat caches for every image that is NOT the active one, before a
+ * reprocess. In per-frame mode each uploaded image can hold its own cached rectified warp; only the
+ * active image's cache is kept warm between reprocesses. The composite `baseRectifiedMat` (the one
+ * large Mat that must stay live) is owned by `state.geometry`, not by the per-image entries, so it is
+ * never touched here.
+ *
+ * No-op for markers/markerless modes: those flows keep at most a single entry in
+ * `state.source.images[]`, so the loop either skips the lone active entry or runs zero times.
+ *
+ * @returns {void}
+ */
+function trimInactivePerFrameRectifiedCaches() {
+  const images = state.source.images;
+  if (!Array.isArray(images) || images.length <= 1) return;
+  const activeIndex = state.source.activeImageIndex;
+  for (let i = 0; i < images.length; i++) {
+    if (i === activeIndex) continue;
+    releaseEntryRectifiedCache(images[i]);
+  }
 }
 
 /**
@@ -5531,7 +5838,10 @@ function getFrameGridCoords(index, alignmentInfo) {
  * @returns {object}
  */
 function getFrameExtractionAlignmentInfo(config, alignmentInfo, col, row, includeMarkerlessNudges) {
-  if (config.alignmentPipeline === "markerless" && includeMarkerlessNudges) {
+  // Per-frame extracts from the same corner-cross lattice as markerless, so both non-marker
+  // pipelines resolve frame quads via the markerless extraction builder (phase nudges are 0 in
+  // per-frame, so this only contributes stabilization/drift/manual-nudge offsets there).
+  if (config.alignmentPipeline !== "markers" && includeMarkerlessNudges) {
     return buildMarkerlessExtractionInfoForFrame(alignmentInfo, col, row);
   }
   return alignmentInfo;
@@ -6021,7 +6331,8 @@ function scheduleMarkerlessStabilizationWarmup(requestId) {
  */
 function scheduleCurrentStabilizationWarmup() {
   window.setTimeout(() => {
-    if (readConfig().alignmentPipeline !== "markerless") {
+    // Stabilization warmup applies to both non-marker pipelines (markerless + per-frame).
+    if (readConfig().alignmentPipeline === "markers") {
       return;
     }
     if (!readConfig().stabilizationEnabled) {
@@ -6664,7 +6975,8 @@ function combineSourceOffsets(baseOffset, extraOffset) {
  * @returns {{x:number,y:number}}
  */
 function getMarkerlessVerticalDriftSourceOffset(config, alignmentInfo, frameIndex) {
-  if (!alignmentInfo || config.alignmentPipeline !== "markerless") {
+  // Vertical Drift Compensation is enabled in both non-marker pipelines (markerless + per-frame).
+  if (!alignmentInfo || config.alignmentPipeline === "markers") {
     return { x: 0, y: 0 };
   }
   const cellHeight = alignmentInfo.gridBounds.height / Math.max(1, alignmentInfo.rows);
@@ -6713,7 +7025,8 @@ function getAutomaticMarkerlessSourceOffset(config, alignmentInfo, frameIndex, i
  * @returns {{x:number,y:number}}
  */
 function getMarkerlessCornerStabilizationOffset(col, row, alignmentInfo) {
-  if (!alignmentInfo || readConfig().alignmentPipeline !== "markerless") {
+  // Stabilization and the Frame Corners panel are shared by both non-marker pipelines.
+  if (!alignmentInfo || readConfig().alignmentPipeline === "markers") {
     return { x: 0, y: 0 };
   }
   const offsets = getStabilizationOffsets();
@@ -6775,7 +7088,8 @@ function getFrameStabilizationSourceOffset(index) {
  * @returns {{x:number,y:number}}
  */
 function getMarkerlessCornerManualNudge(col, row) {
-  if (readConfig().alignmentPipeline !== "markerless") {
+  // Frame Corners overrides (stored as corner nudges) are enabled in markerless and per-frame.
+  if (readConfig().alignmentPipeline === "markers") {
     return { x: 0, y: 0 };
   }
   const override = state.geometry.manualMarkerOverrides.get(getMarkerKey(col, row));
@@ -7014,8 +7328,12 @@ function buildPostRotationPreviewTile(previewCanvas, expected, alignmentInfo, te
 }
 
 /**
- * Build a display-only alignment view for markerless mode that incorporates the current manual
- * phase offset while leaving the underlying stored marker coordinates unphased.
+ * Build a display-only alignment view for the non-marker pipelines (markerless + per-frame) that
+ * incorporates the current corner display offsets while leaving the stored coordinates unphased.
+ *
+ * Per-frame shares the markerless corner-tile display path so its Frame Corners panel renders the
+ * same stabilized/nudged corner tiles. Only true marker mode short-circuits to the raw alignment
+ * (or, while scrubbing post-rotation, the marker post-rotation preview tiles).
  *
  * @param {object | null} alignmentInfo
  * @returns {object | null}
@@ -7024,7 +7342,7 @@ function getDisplayAlignmentInfo(alignmentInfo) {
   if (!alignmentInfo) return null;
   const config = readConfig();
   const showingPostRotationPreview = state.preview.postRotationScrubbing && !!state.preview.rectifiedCanvas;
-  if (config.alignmentPipeline !== "markerless" && !showingPostRotationPreview) {
+  if (config.alignmentPipeline === "markers" && !showingPostRotationPreview) {
     return alignmentInfo;
   }
   const crossRoiScale = config.crossRoiScale;
@@ -7032,7 +7350,7 @@ function getDisplayAlignmentInfo(alignmentInfo) {
     ? getPostRotationPreviewCanvas(state.preview.rectifiedCanvas, getPostRotationPreviewDeg())
     : null;
 
-  if (config.alignmentPipeline !== "markerless") {
+  if (config.alignmentPipeline === "markers") {
     const markerLookup = new Map(alignmentInfo.markerLookup);
     const crossRoiTiles = alignmentInfo.crossRoiTiles.map((tile) => buildPostRotationPreviewTile(
       previewCanvas,
@@ -7188,7 +7506,9 @@ function seedDefaultManualPageContour() {
     { x: right, y: bottom },
     { x: inset, y: bottom },
   ];
-  state.source.manualPageContour = contour.map((point) => ({ x: point.x, y: point.y }));
+  // Seeding a default editable quad is a manual override, so mirror it to the active image entry in
+  // per-frame mode (legacy-only otherwise).
+  setActiveManualPageContour(state, contour.map((point) => ({ x: point.x, y: point.y })), isPerFrameModeActive());
   state.source.rawPageContour = contour.map((point) => ({ x: point.x, y: point.y }));
   state.source.pageQuadSource = "manual-override";
   state.source.thresholdPreviewPageContour = null;
@@ -7282,7 +7602,9 @@ function updateManualPageCorner(index, point) {
   if (!Array.isArray(baseContour) || baseContour.length !== 4) return;
   const nextContour = baseContour.map((corner) => ({ x: corner.x, y: corner.y }));
   nextContour[index] = point;
-  state.source.manualPageContour = nextContour;
+  // In per-frame mode this also stores the override on the active image entry; in markers/markerless
+  // it only writes the legacy field, exactly as before.
+  setActiveManualPageContour(state, nextContour, isPerFrameModeActive());
   state.source.rawPageContour = nextContour.map((corner) => ({ x: corner.x, y: corner.y }));
   state.source.pageQuadSource = "manual-override";
 }
@@ -7357,6 +7679,55 @@ function attachRawPageCornerEditing() {
 
   dom.rawCanvas.addEventListener("pointerup", finishDrag);
   dom.rawCanvas.addEventListener("pointercancel", finishDrag);
+}
+
+/**
+ * Switch the active per-frame image and redraw the raw photo, Page Corners overlay, and
+ * Post-Rotation slider to match it — without rebuilding the rectified preview or animation.
+ *
+ * Active-image switching is UI navigation, not a config change: each image's page-corner override and
+ * Post-Rotation are restored from its entry so the editor operates on the newly active image, but no
+ * reprocessing is scheduled (the existing composite stays live until a real config change). In
+ * markers / markerless modes there is at most one entry, so this just refreshes the raw preview.
+ *
+ * Until the Phase 7 image strip exists this is the supported active-image switch entry point (the
+ * dev console can call `window.plottimation.setActiveImage(1)` or set
+ * `state.source.activeImageIndex` and call `renderRawPreview()` directly).
+ *
+ * @param {number} index Zero-based image index (clamped to the loaded range).
+ * @returns {void}
+ */
+function setActiveImage(index) {
+  const entry = setActiveSourceImage(state, index);
+  if (!entry) return;
+  // Repoint the legacy projections at the newly active entry so every existing reader (raw preview,
+  // Page Corners editor, drag/download, status) sees this image.
+  if (entry.canvas) state.source.canvas = entry.canvas;
+  if (entry.image) state.source.image = entry.image;
+  state.source.filename = entry.filename || "";
+  state.source.mimeType = entry.mimeType || "";
+  state.source.dragUrl = entry.dragUrl || "";
+  // Restore this image's manual page-corner override into the legacy field and the overlay contour.
+  // A live threshold preview belongs to whichever image was last reprocessed, so drop it on switch.
+  const contour = Array.isArray(entry.manualPageContour) && entry.manualPageContour.length === 4
+    ? entry.manualPageContour.map((point) => ({ x: point.x, y: point.y }))
+    : null;
+  state.source.manualPageContour = contour;
+  state.source.rawPageContour = contour ? contour.map((point) => ({ x: point.x, y: point.y })) : null;
+  state.source.pageQuadSource = contour ? "manual-override" : "";
+  state.source.thresholdPreviewPageContour = null;
+  state.source.thresholdPreviewSignature = "";
+  state.preview.activePageCornerDrag = null;
+  // Restore this image's Post-Rotation onto the slider so the control reflects the active image.
+  if (dom.postRotation) {
+    dom.postRotation.value = String(Number.isFinite(entry.postRotationDeg) ? entry.postRotationDeg : 0);
+    updateSliderReadouts();
+  }
+  syncRawPhotoHeadingLink();
+  syncRawPhotoCreditDisplay();
+  renderRawPreview();
+  // Refresh the strip's active-thumbnail highlight to match the newly selected image.
+  renderPerFrameStrip();
 }
 
 /**
@@ -7526,9 +7897,12 @@ function applyMarkerOverride(tile, local, finalize) {
   let detectedX = roiCenterX + (local.x - center);
   let detectedY = roiCenterY + (local.y - center);
   const config = readConfig();
-  const isMarkerless = config.alignmentPipeline === "markerless";
+  // Per-frame shares the markerless corner-nudge override model (stored as deltas from the displayed
+  // corner), so both non-marker pipelines take the nudge path; only true marker mode stores absolute
+  // detected positions and patches the marker objects in place.
+  const usesCornerNudges = config.alignmentPipeline !== "markers";
   const key = getMarkerKey(tile.col, tile.row);
-  if (isMarkerless && state.geometry.alignmentInfo) {
+  if (usesCornerNudges && state.geometry.alignmentInfo) {
     const sourceMarker = state.geometry.alignmentInfo.markerLookup.get(key);
     if (sourceMarker) {
       const displayed = getMarkerlessDisplayedCorner(sourceMarker, tile.col, tile.row, state.geometry.alignmentInfo, false);
@@ -7541,37 +7915,37 @@ function applyMarkerOverride(tile, local, finalize) {
     state.geometry.manualMarkerOverrides.set(key, { x: detectedX, y: detectedY });
   }
   state.preview.activeEditedMarker = finalize ? null : { col: tile.col, row: tile.row };
-  if (state.geometry.alignmentInfo && !isMarkerless) {
+  if (state.geometry.alignmentInfo && !usesCornerNudges) {
     // Manual overrides patch the already-detected alignment object in place, which lets preview/extraction
     // update lazily from the edited marker positions without another CV pass.
     applyManualMarkerOverrides(state.geometry.alignmentInfo);
   }
   revokeGifUrl();
   if (!finalize) {
-    if (isMarkerless) {
+    if (usesCornerNudges) {
       beginMarkerOverrideScrub();
     } else {
       state.preview.markerOverrideScrubbing = true;
     }
   }
   let affectedMarkerFrames = null;
-  if (isMarkerless && !finalize) {
+  if (usesCornerNudges && !finalize) {
     invalidateCurrentPreviewFrameForMarker(tile.col, tile.row);
-  } else if (isMarkerless) {
+  } else if (usesCornerNudges) {
     invalidateMarkerlessNudgedFramesForMarker(tile.col, tile.row);
   } else {
     affectedMarkerFrames = invalidateFramesForMarker(tile.col, tile.row);
   }
   syncMarkerEditingUi();
   if (finalize) {
-    if (isMarkerless) {
+    if (usesCornerNudges) {
       endMarkerOverrideScrub();
     } else {
       state.preview.markerOverrideScrubbing = false;
     }
     renderCrossRoiGrid(state.geometry.alignmentInfo);
     scheduleStabilizationPreviewUpdate();
-    if (!isMarkerless) {
+    if (!usesCornerNudges) {
       if (affectedMarkerFrames) {
         scheduleCurrentPreviewFrameWarmupForSourceIndices(affectedMarkerFrames);
       } else {
@@ -7593,8 +7967,10 @@ function restoreMarkerOverride(tile) {
   const key = getMarkerKey(tile.col, tile.row);
   state.geometry.manualMarkerOverrides.delete(key);
   state.preview.activeEditedMarker = null;
-  const isMarkerless = readConfig().alignmentPipeline === "markerless";
-  if (state.geometry.alignmentInfo && !isMarkerless) {
+  // Non-marker pipelines (markerless + per-frame) clear corner-nudge overrides via cache
+  // invalidation; only marker mode restores auto-detected positions on the live marker objects.
+  const usesCornerNudges = readConfig().alignmentPipeline !== "markers";
+  if (state.geometry.alignmentInfo && !usesCornerNudges) {
     const marker = state.geometry.alignmentInfo.markerLookup.get(key);
     const liveTile = state.geometry.alignmentInfo.crossRoiTileMap?.get(key);
     if (marker && Number.isFinite(marker.autoDetectedX)) {
@@ -7610,7 +7986,7 @@ function restoreMarkerOverride(tile) {
   }
   revokeGifUrl();
   let affectedMarkerFrames = null;
-  if (isMarkerless) {
+  if (usesCornerNudges) {
     invalidateMarkerlessNudgedFramesForMarker(tile.col, tile.row);
   } else {
     affectedMarkerFrames = invalidateFramesForMarker(tile.col, tile.row);
@@ -7618,7 +7994,7 @@ function restoreMarkerOverride(tile) {
   syncMarkerEditingUi();
   renderCrossRoiGrid(state.geometry.alignmentInfo);
   scheduleStabilizationPreviewUpdate();
-  if (!isMarkerless) {
+  if (!usesCornerNudges) {
     if (affectedMarkerFrames) {
       scheduleCurrentPreviewFrameWarmupForSourceIndices(affectedMarkerFrames);
     } else {
@@ -7647,6 +8023,10 @@ function buildSettingsTsv(config) {
     sourceCredit: state.source.sourceCredit,
     manualMarkerOverrides: state.geometry.manualMarkerOverrides,
     manualPageContour: state.source.manualPageContour,
+    // Per-frame mode persists one page-corner/post-rotation override set per uploaded image, keyed by
+    // upload order. buildSettingsTsv only emits the indexed keys when config.alignmentPipeline is
+    // "per-frame", so passing the entries unconditionally is harmless for markers/markerless saves.
+    perImageEntries: state.source.images,
     sanitizeFilenameBase,
   });
 }

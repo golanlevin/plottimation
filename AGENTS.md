@@ -6,9 +6,10 @@
 - Do not create a separate desktop/Electron fork unless explicitly requested.
 
 ## Architecture
-- The app has two alignment pipelines:
+- The app has three alignment pipelines:
   - `Markers`
   - `Markerless`
+  - `Per-frame` (one uploaded image per animation frame; see `per_frame_pipeline_plan.md`)
 - `Markerless` currently has two stabilization methods:
   - `Neighbor Comparison`
   - `Median-Frame Comparison`
@@ -71,6 +72,27 @@
   that GIF via the generated object URL and `download` filename. Revoking the GIF URL must also
   remove that header link.
 
+## Per-Frame Notes
+- Per-frame mode treats each uploaded image as one animation frame; image count equals frame count.
+  The rectified pages are resized to a common cell size and stacked into a synthetic 1×N composite
+  `baseRectifiedMat`, after which extraction/stabilization/ordering/export run unchanged.
+- Per-image page-corner overrides (and per-image post-rotation) are post-load, pre-rectification
+  edits. They feed `rectifySinglePage` for that image only and never affect other images.
+- Active-image switching is a UI navigation, not a config change: it redraws the raw photo, Page
+  Corners overlay, and Post-Rotation slider for the newly active image but does NOT trigger
+  reprocessing. The live composite/animation stays until a real config change.
+- Per-frame mode disables the marker-specific and markerless-specific controls (marker editor,
+  grid-edge controls, gutter/phase sliders, Rectified Grid pre/post toggle). Stabilization, Vertical
+  Drift Compensation, Frame Corners overrides, ordering, appearance, and export stay enabled.
+- Per-frame `_settings.txt` round-trip stores per-image overrides and post-rotation keyed by upload
+  order plus the image count. Settings files carry no image data, so restoring a saved per-frame
+  project requires re-uploading the same images in the same order; overrides reattach by upload
+  order, not by filename.
+- The per-frame composite cell size is clamped by long edge (uniformly, so the rectified-page /
+ Layout paper aspect ratio is preserved) and held to the same total-area memory ceiling the
+ single-page rectified path uses; if the median cell size would exceed either bound, `cellW`/`cellH`
+ are scaled down uniformly so the composite Mat cannot blow up on large inputs.
+
 ## Markerless Notes
 - Markerless pitch estimation comes from grayscale blurred autocorrelation.
 - Markerless phase estimation uses combined gutter evidence.
@@ -107,7 +129,7 @@
 
 ## Verification
 - After JS edits, run lightweight parse checks.
-- If shared UI changes, check both pipelines.
+- If shared UI changes, check all three pipelines (markers, markerless, per-frame).
 - If viewer-tab or mobile-control naming changes, check mobile mode behavior.
 - If settings-bearing controls change, check settings round-trip behavior.
 - If Page Corners override behavior changes, check:

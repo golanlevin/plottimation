@@ -207,6 +207,130 @@ function applyGifPreviewDisplaySize(dom, width, height) {
   dom.gifImage.style.height = "";
 }
 
+/** Baseline-profile H.264 codec strings in ascending AVC level order. */
+const H264_BASELINE_CODEC_LEVELS = [
+  { maxCodedArea: 921_600, codec: "avc1.42001f" }, // Level 3.1 — up to ~1280×720 coded
+  { maxCodedArea: 1_311_744, codec: "avc1.420020" }, // Level 3.2
+  { maxCodedArea: 2_097_152, codec: "avc1.420028" }, // Level 4.0 — up to ~1920×1088 coded
+  { maxCodedArea: 2_097_152, codec: "avc1.420029" }, // Level 4.1
+  { maxCodedArea: 2_222_080, codec: "avc1.42002a" }, // Level 4.2
+  { maxCodedArea: 5_670_400, codec: "avc1.420032" }, // Level 5.0
+  { maxCodedArea: 9_437_184, codec: "avc1.420033" }, // Level 5.1
+];
+
+/** Legacy codec strings kept for browsers that reject the newer baseline level forms at probe time. */
+const H264_LEGACY_CODEC_CANDIDATES = ["avc1.42E01E", "avc1.4D401E"];
+
+/**
+ * Return the H.264 coded-area size after 16×16 macroblock alignment.
+ *
+ * @param {number} width
+ * @param {number} height
+ * @returns {number}
+ */
+function getH264CodedArea(width, height) {
+  const codedWidth = Math.ceil(width / 16) * 16;
+  const codedHeight = Math.ceil(height / 16) * 16;
+  return codedWidth * codedHeight;
+}
+
+/**
+ * Return baseline-profile codec candidates whose AVC level can contain the coded area.
+ *
+ * @param {number} codedArea
+ * @returns {string[]}
+ */
+function getBaselineCodecCandidatesForCodedArea(codedArea) {
+  const firstSufficientIndex = H264_BASELINE_CODEC_LEVELS.findIndex((entry) => codedArea <= entry.maxCodedArea);
+  if (firstSufficientIndex === -1) {
+    return [H264_BASELINE_CODEC_LEVELS[H264_BASELINE_CODEC_LEVELS.length - 1].codec];
+  }
+  const candidates = [];
+  for (let i = firstSufficientIndex; i < H264_BASELINE_CODEC_LEVELS.length; i++) {
+    const codec = H264_BASELINE_CODEC_LEVELS[i].codec;
+    if (!candidates.includes(codec)) {
+      candidates.push(codec);
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Probe whether the browser can encode one H.264 configuration with WebCodecs.
+ *
+ * @param {string} codec
+ * @param {number} width
+ * @param {number} height
+ * @param {number} [fps=20]
+ * @param {number} [bitrate=500_000]
+ * @returns {Promise<boolean>}
+ */
+async function isMp4EncoderConfigSupported(codec, width, height, fps = 20, bitrate = 500_000) {
+  if (typeof globalThis.VideoEncoder === "undefined" || typeof VideoEncoder.isConfigSupported !== "function") {
+    return false;
+  }
+  try {
+    const support = await VideoEncoder.isConfigSupported({
+      codec,
+      width,
+      height,
+      bitrate,
+      framerate: fps,
+      avc: { format: "avc" },
+    });
+    return !!support?.supported;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pick the lowest supported baseline H.264 codec that can encode the requested frame size.
+ *
+ * @param {number} width
+ * @param {number} height
+ * @param {{fps?:number, bitrate?:number}} [options]
+ * @returns {Promise<string>}
+ */
+export async function resolveMp4Codec(width, height, options = {}) {
+  const safeWidth = Math.max(1, Math.round(width || 1));
+  const safeHeight = Math.max(1, Math.round(height || 1));
+  const fps = options.fps ?? 20;
+  const bitrate = options.bitrate ?? 500_000;
+  const candidates = getBaselineCodecCandidatesForCodedArea(getH264CodedArea(safeWidth, safeHeight));
+  for (const codec of candidates) {
+    if (await isMp4EncoderConfigSupported(codec, safeWidth, safeHeight, fps, bitrate)) {
+      return codec;
+    }
+  }
+  return "";
+}
+
+/**
+ * Probe whether this browser can encode H.264 frames with WebCodecs for later MP4 muxing.
+ *
+ * @returns {Promise<{supported:boolean, codec:string}>}
+ */
+export async function detectMp4ExportSupport() {
+  if (typeof globalThis.VideoEncoder === "undefined" || typeof VideoEncoder.isConfigSupported !== "function") {
+    return { supported: false, codec: "" };
+  }
+  const probeWidth = 640;
+  const probeHeight = 480;
+  const probeBitrate = 500_000;
+  const probeFps = 20;
+  const codec = await resolveMp4Codec(probeWidth, probeHeight, { fps: probeFps, bitrate: probeBitrate });
+  if (codec) {
+    return { supported: true, codec };
+  }
+  for (const legacyCodec of H264_LEGACY_CODEC_CANDIDATES) {
+    if (await isMp4EncoderConfigSupported(legacyCodec, probeWidth, probeHeight, probeFps, probeBitrate)) {
+      return { supported: true, codec: legacyCodec };
+    }
+  }
+  return { supported: false, codec: "" };
+}
+
 /**
  * Estimate a target H.264 bitrate from dimensions, frame rate, and the shared quality slider.
  *
@@ -421,6 +545,15 @@ export async function exportMp4(deps) {
   try {
     const { Muxer, ArrayBufferTarget } = await loadMp4MuxerModule();
     const bitrate = estimateMp4Bitrate(mp4Size.width, mp4Size.height, config.fps, config.exportOptions.mp4Quality);
+    const codec = await resolveMp4Codec(mp4Size.width, mp4Size.height, {
+      fps: config.fps,
+      bitrate,
+    });
+    if (!codec) {
+      throw new Error(
+        `No supported H.264 encoder configuration for ${mp4Size.width}x${mp4Size.height}. Try a smaller output size.`
+      );
+    }
     const muxer = new Muxer({
       target: new ArrayBufferTarget(),
       fastStart: "in-memory",
@@ -438,7 +571,7 @@ export async function exportMp4(deps) {
       },
     });
     encoder.configure({
-      codec: state.runtime.mp4Codec,
+      codec,
       width: mp4Size.width,
       height: mp4Size.height,
       bitrate,

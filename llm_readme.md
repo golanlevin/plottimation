@@ -44,9 +44,34 @@ This shared output structure is why the same editing panel can be reused as:
 - `Frame Alignment Markers` in marker mode
 - `Frame Alignment Centers` / `Corners` in markerless mode
 
+### Per-Frame
+
+Used when each animation frame is its own uploaded image rather than one cell of a single
+frame-sheet photo. Image count equals frame count (treated internally as a flat 1×N strip).
+
+- `pipeline.js → runPerFramePipeline(images, config, requestId, throwIfAborted)` is the entry point;
+  `runPipeline` dispatches to it when `config.alignmentPipeline === "per-frame"`.
+- each uploaded image is page-rectified independently via `rectifySinglePage` (called with a per-image
+  config copy aliased to `"markerless"`, carrying that image's `manualPageContour` and `postRotationDeg`)
+- the rectified pages are resized to a single common cell size (median rectified dimensions, clamped
+  uniformly by long edge so the Layout paper aspect survives, and held to the same total-area memory
+  ceiling as the single-page rectified path) and stacked into a synthetic 1×N composite
+  `baseRectifiedMat`
+- synthetic corner intersections are emitted into the same `markerLookup` structure (via
+  `buildUnrefinedCrossRegionInfo`), so downstream extraction/stabilization/ordering/export run unchanged
+- per-image page-corner and post-rotation overrides are post-load, pre-rectification edits on the
+  *active* image; switching the active image is UI navigation only and does not reprocess
+- the image strip (`js/per-frame-strip.js`) handles select / reorder / delete / add; reorder and delete
+  reprocess, select does not
+- per-image overrides round-trip through `_settings.txt` keyed by upload order (see
+  `js/settings-io.js`); reloading a saved project requires re-uploading the same images in the same order
+
+The full implementation plan, including the phased build-out and the per-phase "As built" notes, lives
+in [per_frame_pipeline_plan.md](per_frame_pipeline_plan.md).
+
 ## Light-on-dark design
 
-`Light-on-dark design` is shared by both pipelines.
+`Light-on-dark design` is shared by the marker and markerless pipelines.
 
 ### Markers
 
@@ -280,6 +305,16 @@ Overlays currently include:
 - green current-frame quad
 - green connected edge preview while actively editing a marker/corner override
 - red omitted-frame quads with a translucent gray fill and diagonal slash
+
+## Page Detection Border-Quad Rescue
+
+When full-resolution page detection selects (near-)the whole image as the largest quad,
+`pipeline.js → refineBorderPageQuadWithDownscaledDetection` retries detection on a 512px downscale.
+The retry first reuses the user's threshold method/offset; if that still yields a border quad it
+tries Otsu candidates (`otsu` at the user offset, then `otsu` at offset 0), which handle bright
+backgrounds that the default `offset-peak` threshold merges with the paper. A rescue quad is only
+accepted when it is a substantial interior quad (≥10% area, not near the image border), so genuine
+scanner-style full-bleed inputs still fall through to the source-boundary page.
 
 ## Page Detection Threshold Preview
 

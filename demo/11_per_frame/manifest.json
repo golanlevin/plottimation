@@ -1,0 +1,30 @@
+{
+  "type": "per-frame",
+  "settings": "11_per_frame_settings.txt",
+  "images": [
+    "2026-06-12 10-05-02 Medium.jpeg",
+    "2026-06-12 10-05-16 Medium.jpeg",
+    "2026-06-12 10-05-25 Medium.jpeg",
+    "2026-06-12 10-05-34 Medium.jpeg",
+    "2026-06-12 10-05-43 Medium.jpeg",
+    "2026-06-12 10-05-53 Medium.jpeg",
+    "2026-06-12 10-06-01 Medium.jpeg",
+    "2026-06-12 10-06-10 Medium.jpeg",
+    "2026-06-12 10-06-19 Medium.jpeg",
+    "2026-06-12 10-06-26 Medium.jpeg",
+    "2026-06-12 10-06-35 Medium.jpeg",
+    "2026-06-12 10-06-41 Medium.jpeg",
+    "2026-06-12 10-06-48 Medium.jpeg",
+    "2026-06-12 10-06-57 Medium.jpeg",
+    "2026-06-12 10-07-04 Medium.jpeg",
+    "2026-06-12 10-07-13 Medium.jpeg",
+    "2026-06-12 10-07-20 Medium.jpeg",
+    "2026-06-12 10-07-28 Medium.jpeg",
+    "2026-06-12 10-07-35 Medium.jpeg",
+    "2026-06-12 10-07-43 Medium.jpeg",
+    "2026-06-12 10-07-52 Medium.jpeg",
+    "2026-06-12 10-07-59 Medium.jpeg",
+    "2026-06-12 10-08-07 Medium.jpeg",
+    "2026-06-12 10-08-14 Medium.jpeg"
+  ]
+}

@@ -26,6 +26,20 @@ const MARKERLESS_PHASE_BAND_WIDTH = 3;
 const MARKERLESS_DEFAULT_CORNER_TILE_SCALE = 0.52;
 const MARKERLESS_DEFAULT_CORNER_TILE_MAX_SIDE_PX = 127;
 const RECTIFIED_PREVIEW_LONG_EDGE_PX = 2200;
+// Per-frame mode resizes every rectified page to one common cell size before stacking them into a
+// synthetic 1×N composite sheet. The chosen median cell dimensions are clamped to this range so a
+// single oversized page cannot blow up the composite Mat. This is the per-dimension guard; the strict
+// composite-area ceiling (PER_FRAME_COMPOSITE_AREA_CEILING_PX) below bounds the whole stacked sheet.
+const PER_FRAME_MIN_CELL_PX = 16;
+const PER_FRAME_MAX_CELL_PX = 1600;
+// Strict composite-area ceiling for the stacked 1×N per-frame sheet. The existing single-page path
+// never materializes a rectified sheet larger than RECTIFIED_PREVIEW_LONG_EDGE_PX on its long edge
+// (matToPreviewCanvas caps the preview, and the high-res warp is diagonal-capped), so the largest
+// single working sheet is bounded by RECTIFIED_PREVIEW_LONG_EDGE_PX². The composite (cellW × N × cellH)
+// is held to that same total-area budget; if the median cell size would exceed it, cellW and cellH are
+// scaled down uniformly (aspect preserved) before allocation.
+const PER_FRAME_COMPOSITE_AREA_CEILING_PX =
+  RECTIFIED_PREVIEW_LONG_EDGE_PX * RECTIFIED_PREVIEW_LONG_EDGE_PX;
 const NEAR_IDENTITY_PAGE_AREA_PCT = 0.998;
 const NEAR_IDENTITY_CORNER_TOLERANCE_PX = 2;
 const NEAR_IDENTITY_DIM_TOLERANCE_PX = 2;
@@ -246,7 +260,384 @@ function clampPositiveConvolutionToUint8(conv32, target8) {
  *   rectifiedDownloadUsesRawSource: boolean
  * }}
  */
-export function runPipeline(sourceCanvas, config, requestId, throwIfAborted) {
+export function runPipeline(sourceCanvas, config, requestId, throwIfAborted, images = null) {
+  // Per-frame mode does not rectify a single frame-sheet; it rectifies one page per uploaded image
+  // and stacks them into a synthetic 1×N composite. Dispatch before touching the single-page path.
+  // `images` is passed in by the caller so this module never reaches into `state` directly.
+  if (config.alignmentPipeline === "per-frame") {
+    return runPerFramePipeline(images || [], config, requestId, throwIfAborted);
+  }
+
+  const useMarkerlessAlignment = config.alignmentPipeline === "markerless";
+  let rectifiedWarp = null;
+  let pageRectification = null;
+
+  try {
+    // Page detection + rectification + Post-Rotation now live in a reusable helper so the per-frame
+    // pipeline can run them once per uploaded image. The caller owns the returned `rectifiedWarp`.
+    pageRectification = rectifySinglePage(sourceCanvas, config, requestId, throwIfAborted);
+    rectifiedWarp = pageRectification.rectifiedWarp;
+    const {
+      pageQuad,
+      pageQuadSource,
+      pageWarpPreviewCanvas,
+      pageWarpPreviewWidth,
+      pageWarpPreviewHeight,
+      useNearIdentityRectification,
+      threshVal,
+      pageSizeLow,
+      pageSizeHigh,
+    } = pageRectification;
+
+    const pagePreviewGridBounds = rectifiedWarp.previewGridQuad
+      ? { ...rectifiedWarp.gridBounds }
+      : null;
+
+    // Resolve the marker lattice if enabled; otherwise keep the nominal grid and unrefined ROI views.
+    const alignmentInfo = config.useCrossAlignment
+      ? (
+        useMarkerlessAlignment
+          ? buildMarkerlessAlignmentData(
+              rectifiedWarp.visionMat,
+              config.frameCols,
+              config.frameRows,
+              config.crossRoiScale,
+              rectifiedWarp.gridBounds,
+              config.paperMarginXPx,
+              config.paperMarginYPx,
+              {
+                useDarkness: config.markerlessUseDarkness,
+                useTexture: config.markerlessUseTexture,
+                useVariance: config.markerlessUseVariance,
+                lightOnDark: config.lightOnDarkDesign,
+                blurScale: config.markerlessAutocorrelationBlurScale,
+              },
+            )
+          : buildCrossAlignmentData(
+              rectifiedWarp.visionMat,
+              config.frameCols,
+              config.frameRows,
+              config.crossRoiScale,
+              rectifiedWarp.gridBounds,
+              {
+                markerType: config.alignmentMarkerType,
+                includeCornerCrosses: rectifiedWarp.includeCornerCrosses,
+                detectCrossesWithConvolution: config.detectCrossesWithConvolution,
+              }
+            )
+      )
+      : buildUnrefinedCrossRegionInfo(
+          rectifiedWarp.visionMat,
+          config.frameCols,
+          config.frameRows,
+          "disabled",
+          rectifiedWarp.gridBounds,
+          config.crossRoiScale,
+          {
+            markerType: config.alignmentMarkerType,
+            includeCornerCrosses: rectifiedWarp.includeCornerCrosses,
+          }
+        );
+    // In the all-cross format, the coarse quad is only approximate; use the detected corner crosses
+    // to tighten the working grid bounds before frame extraction.
+    if (rectifiedWarp.includeCornerCrosses) {
+      refineAlignmentBoundsFromCornerCrosses(alignmentInfo);
+    }
+    throwIfAborted(requestId);
+
+    // Extract each animation frame from the styled rectified sheet with the chosen interpolation mode.
+    const frames = sliceRectifiedToCanvases(
+      rectifiedWarp.styledMat,
+      alignmentInfo,
+      config.crop,
+      getCvInterpolationFlag(config.exportOptions.resampling),
+      requestId,
+      throwIfAborted
+    );
+    const rectifiedCanvas = matToPreviewCanvas(rectifiedWarp.styledMat, RECTIFIED_PREVIEW_LONG_EDGE_PX);
+    const rectifiedMat = rectifiedWarp.styledMat;
+    rectifiedWarp.styledMat = null;
+    const statusText = buildStatusText({
+      threshVal,
+      rawWidth: sourceCanvas.width,
+      rawHeight: sourceCanvas.height,
+      pageAreaPct: pageQuad.areaPct,
+      pageWarpWidth: pageSizeLow.width,
+      pageWarpHeight: pageSizeLow.height,
+      highPageWarpWidth: pageSizeHigh.width,
+      highPageWarpHeight: pageSizeHigh.height,
+      alignmentInfo,
+      frameCount: frames.length,
+      expectedFrameCount: config.frameCols * config.frameRows,
+      rectifiedWidth: rectifiedMat.cols,
+      rectifiedHeight: rectifiedMat.rows,
+      animationWidth: frames[0]?.width || 0,
+      animationHeight: frames[0]?.height || 0,
+      gridDetector: "cross-only",
+    });
+
+    return {
+      frames,
+      rectifiedCanvas,
+      rectifiedMat,
+      pagePreviewCanvas: pageWarpPreviewCanvas,
+      pagePreviewWidth: pageWarpPreviewWidth,
+      pagePreviewHeight: pageWarpPreviewHeight,
+      pagePreviewGridQuad: rectifiedWarp.previewGridQuad || null,
+      pagePreviewGridBounds,
+      alignmentInfo,
+      statusText,
+      pageQuadPoints: pageQuad.points,
+      pageQuadSource,
+      rectifiedDownloadUsesRawSource:
+        useNearIdentityRectification &&
+        useMarkerlessAlignment &&
+        Math.abs(Number(config.postRotationDeg) || 0) < 1e-6,
+    };
+  } catch (error) {
+    // `rectifySinglePage` already attaches a partialResult for failures in the page-rectification
+    // stage. Only fill it in here for failures that happen later (alignment / extraction), where the
+    // page quad and warp preview are already available from the returned rectification info.
+    if (error?.name !== "ProcessAbortedError") {
+      if (error && typeof error === "object" && !error.partialResult) {
+        error.partialResult = {
+          pageQuadPoints: pageRectification?.pageQuad?.points || null,
+          pageQuadSource: pageRectification?.pageQuadSource || "pipeline-detection",
+          rectifiedCanvas: pageRectification?.pageWarpPreviewCanvas || null,
+        };
+      }
+    }
+    throw error;
+  } finally {
+    // `rectifySinglePage` released every intermediate Mat itself; only the returned rectifiedWarp is
+    // still owned here. Its styledMat is set to null after being handed off as `rectifiedMat`.
+    rectifiedWarp?.visionMat?.delete();
+    rectifiedWarp?.styledMat?.delete();
+  }
+}
+
+/**
+ * Per-frame alignment pipeline.
+ *
+ * Instead of one frame-sheet photo, the user uploads one image per animation frame. Each image is
+ * page-rectified independently (reusing {@link rectifySinglePage}), every rectified page is resized
+ * to a single common cell size, and the cells are stacked horizontally into a synthetic `1 × N`
+ * composite sheet. From that point on the rest of the app treats the composite exactly like a
+ * markerless frame-sheet, so stabilization / ordering / appearance / export need no per-frame
+ * branching.
+ *
+ * Ownership: the caller takes ownership of the returned `rectifiedMat` (the composite) and must
+ * delete it. Every other Mat allocated here — per-image rectified pages and per-cell resize buffers —
+ * is released internally, including on abort or failure.
+ *
+ * Each `rectifySinglePage` call is handed a shallow copy of `config` with the per-image fields
+ * overridden. `alignmentPipeline` is aliased to `"markerless"` for that copy because
+ * `rectifySinglePage` branches its near-identity fast path and grid rectification on that value; the
+ * base `config.alignmentPipeline` stays `"per-frame"` for the dispatcher and downstream UI gating.
+ *
+ * @param {Array<{canvas:HTMLCanvasElement, manualPageContour?:object|null, postRotationDeg?:number}>} images
+ * @param {object} config
+ * @param {number} requestId
+ * @param {(requestId:number) => void} throwIfAborted
+ * @returns {{
+ *   frames: HTMLCanvasElement[],
+ *   rectifiedCanvas: HTMLCanvasElement,
+ *   rectifiedMat: cv.Mat,
+ *   pagePreviewCanvas: null,
+ *   pagePreviewWidth: number,
+ *   pagePreviewHeight: number,
+ *   pagePreviewGridQuad: null,
+ *   pagePreviewGridBounds: null,
+ *   alignmentInfo: object,
+ *   statusText: string,
+ *   pageQuadPoints: null,
+ *   pageQuadSource: "per-frame",
+ *   rectifiedDownloadUsesRawSource: false
+ * }}
+ */
+function runPerFramePipeline(images, config, requestId, throwIfAborted) {
+  const entries = Array.isArray(images) ? images.filter((entry) => entry && entry.canvas) : [];
+  if (entries.length === 0) {
+    throw new Error("Per-frame mode requires at least one uploaded image.");
+  }
+  const interpolation = getCvInterpolationFlag(config.exportOptions.resampling);
+  /** @type {(cv.Mat | null)[]} Per-image styled (BGR) rectified pages, freed as they are composited. */
+  const cellStyledMats = [];
+  let composite = null;
+
+  try {
+    // 1-3. Rectify each uploaded page independently. Per-frame mode does not run per-image alignment,
+    // so the grayscale vision Mat is released immediately and only the styled (BGR) page is kept as
+    // the cell source.
+    for (const entry of entries) {
+      throwIfAborted(requestId);
+      const perImageConfig = {
+        ...config,
+        // rectifySinglePage branches its fast path / grid rectification on this value, so per-frame
+        // mode aliases to "markerless" here rather than passing "per-frame".
+        alignmentPipeline: "markerless",
+        // Per-image page-corner override (source-space quad). Phase 5 will populate this from the UI.
+        manualPageQuadPoints: entry.manualPageContour ?? null,
+        // No live threshold-preview fallback when rectifying per image.
+        fallbackPageQuadPoints: null,
+        // Per-image Post-Rotation. Phase 5 stores this on the image entry.
+        postRotationDeg: entry.postRotationDeg ?? 0,
+      };
+      const rectification = rectifySinglePage(entry.canvas, perImageConfig, requestId, throwIfAborted);
+      const rectifiedWarp = rectification.rectifiedWarp;
+      rectifiedWarp.visionMat?.delete();
+      rectifiedWarp.visionMat = null;
+      cellStyledMats.push(rectifiedWarp.styledMat);
+    }
+    throwIfAborted(requestId);
+
+    // 4. Pick a single common cell size from the median rectified dimensions. The per-dimension cap
+    // is applied as a UNIFORM long-edge scale so the rectified-page aspect ratio (which carries the
+    // Layout paper aspect) survives; clamping width and height independently would square off any
+    // cell whose both dimensions exceed the cap and squish the frames.
+    const frameCount = cellStyledMats.length;
+    const widths = cellStyledMats.map((mat) => mat.cols);
+    const heights = cellStyledMats.map((mat) => mat.rows);
+    let cellW = Math.max(1, Math.round(computeMedian(widths)));
+    let cellH = Math.max(1, Math.round(computeMedian(heights)));
+    const longEdgeScale = Math.min(1, PER_FRAME_MAX_CELL_PX / Math.max(cellW, cellH));
+    cellW = Math.max(PER_FRAME_MIN_CELL_PX, Math.round(cellW * longEdgeScale));
+    cellH = Math.max(PER_FRAME_MIN_CELL_PX, Math.round(cellH * longEdgeScale));
+    // Strict composite-area ceiling: the whole stacked sheet (cellW × N × cellH) must fit the same
+    // memory budget the single-page path uses (RECTIFIED_PREVIEW_LONG_EDGE_PX²). If the median cells
+    // would exceed it, scale cellW and cellH down UNIFORMLY so the cell aspect ratio is preserved.
+    const compositeArea = cellW * cellH * frameCount;
+    if (compositeArea > PER_FRAME_COMPOSITE_AREA_CEILING_PX) {
+      const scale = Math.sqrt(PER_FRAME_COMPOSITE_AREA_CEILING_PX / compositeArea);
+      cellW = Math.max(PER_FRAME_MIN_CELL_PX, Math.round(cellW * scale));
+      cellH = Math.max(PER_FRAME_MIN_CELL_PX, Math.round(cellH * scale));
+    }
+
+    // 5-6. Resize each rectified page to the common cell size and copy it into its composite column.
+    // Each per-image styled Mat is freed immediately after it is consumed.
+    composite = new cv.Mat(cellH, cellW * frameCount, cv.CV_8UC3, new cv.Scalar(0, 0, 0));
+    const cellSize = new cv.Size(cellW, cellH);
+    for (let i = 0; i < frameCount; i++) {
+      throwIfAborted(requestId);
+      const styledMat = cellStyledMats[i];
+      const resized = new cv.Mat();
+      try {
+        if (styledMat.cols === cellW && styledMat.rows === cellH) {
+          styledMat.copyTo(resized);
+        } else {
+          cv.resize(styledMat, resized, cellSize, 0, 0, interpolation);
+        }
+        const roi = composite.roi(new cv.Rect(i * cellW, 0, cellW, cellH));
+        try {
+          resized.copyTo(roi);
+        } finally {
+          roi.delete();
+        }
+      } finally {
+        resized.delete();
+        styledMat.delete();
+        cellStyledMats[i] = null;
+      }
+    }
+    throwIfAborted(requestId);
+
+    // 7. Synthesize the 1×N corner lattice the downstream subsystems expect. The cell boundaries are
+    // known exactly (no detection needed), so the unrefined-region builder used by markerless mode is
+    // reused directly with regular corner intersections at the column boundaries.
+    const gridBounds = { left: 0, top: 0, width: composite.cols, height: composite.rows };
+    const alignmentInfo = buildUnrefinedCrossRegionInfo(
+      composite,
+      frameCount,
+      1,
+      "per-frame",
+      gridBounds,
+      config.crossRoiScale,
+      { markerType: "crosses", includeCornerCrosses: true }
+    );
+    throwIfAborted(requestId);
+
+    // 9. Extract each frame canvas from the composite using the same slicer as the other pipelines.
+    const frames = sliceRectifiedToCanvases(
+      composite,
+      alignmentInfo,
+      config.crop,
+      interpolation,
+      requestId,
+      throwIfAborted
+    );
+
+    // 8. Bounded preview canvas of the composite sheet for the Rectified Grid panel.
+    const rectifiedCanvas = matToPreviewCanvas(composite, RECTIFIED_PREVIEW_LONG_EDGE_PX);
+
+    const statusText = [
+      t("status.framesExtracted", { count: frames.length, expected: frameCount }),
+      t("status.rectifiedSheet", { width: composite.cols, height: composite.rows }),
+      t("status.animationSize", { width: frames[0]?.width || 0, height: frames[0]?.height || 0 }),
+    ].join("\n");
+
+    // 10. Hand the composite to the caller; clear our reference so the finally block does not free it.
+    const rectifiedMat = composite;
+    composite = null;
+    return {
+      frames,
+      rectifiedCanvas,
+      rectifiedMat,
+      pagePreviewCanvas: null,
+      pagePreviewWidth: 0,
+      pagePreviewHeight: 0,
+      pagePreviewGridQuad: null,
+      pagePreviewGridBounds: null,
+      alignmentInfo,
+      statusText,
+      pageQuadPoints: null,
+      pageQuadSource: "per-frame",
+      rectifiedDownloadUsesRawSource: false,
+    };
+  } finally {
+    // Release any per-image styled Mats not yet consumed (abort/failure before they were composited).
+    for (const mat of cellStyledMats) {
+      mat?.delete?.();
+    }
+    // If we threw after allocating the composite but before handing it off, release it here.
+    composite?.delete?.();
+  }
+}
+
+/**
+ * Detect, rectify, and Post-Rotate a single source page into a working sheet.
+ *
+ * This is the shared page-localization + rectification stage of the pipeline, extracted so it can be
+ * reused per uploaded image by the per-frame pipeline. Markers and markerless modes both call it via
+ * {@link runPipeline}; behaviour is identical to the previous inline implementation.
+ *
+ * Ownership: the caller takes ownership of the returned `rectifiedWarp` (both `visionMat` and
+ * `styledMat`) and must delete those Mats. Every other intermediate Mat is released internally,
+ * including on failure.
+ *
+ * Reads from `config`: `alignmentPipeline` (near-identity fast path branches on markerless),
+ * `lightOnDarkDesign`, `thresholdMethod`, `thresholdOffset`, `manualPageQuadPoints`,
+ * `fallbackPageQuadPoints`, `paperAspect`, `postRotationDeg`, plus the frame-grid fields consumed by
+ * the marker rectifier (`useRectifiedAsSource`, `frameCols`, `frameRows`, `crossRoiScale`,
+ * `paperMarginXPx`, `paperMarginYPx`, `boundarySensitivity`, `boundaryPersistencePx`).
+ *
+ * @param {HTMLCanvasElement} sourceCanvas
+ * @param {object} config
+ * @param {number} requestId
+ * @param {(requestId:number) => void} throwIfAborted
+ * @returns {{
+ *   rectifiedWarp: {visionMat:cv.Mat, styledMat:cv.Mat, gridBounds:{left:number, top:number, width:number, height:number}, includeCornerCrosses:boolean, previewGridQuad:object|null},
+ *   pageQuad: {points:{x:number,y:number}[], areaPct:number, quadAreaPx:number},
+ *   pageQuadSource: "pipeline-detection" | "manual-override" | "threshold-preview-fallback",
+ *   pageWarpPreviewCanvas: HTMLCanvasElement | null,
+ *   pageWarpPreviewWidth: number,
+ *   pageWarpPreviewHeight: number,
+ *   useNearIdentityRectification: boolean,
+ *   threshVal: number,
+ *   pageSizeLow: cv.Size,
+ *   pageSizeHigh: cv.Size
+ * }}
+ */
+function rectifySinglePage(sourceCanvas, config, requestId, throwIfAborted) {
   const useMarkerlessAlignment = config.alignmentPipeline === "markerless";
   const useInvertedMarkerVision = !useMarkerlessAlignment && config.lightOnDarkDesign;
   const styledSrcRgba = cv.imread(sourceCanvas);
@@ -378,126 +769,33 @@ export function runPipeline(sourceCanvas, config, requestId, throwIfAborted) {
       pageWarpHigh = null;
     }
     applyPostRectificationRotation(rectifiedWarp, config.postRotationDeg);
-    const pagePreviewGridBounds = rectifiedWarp.previewGridQuad
-      ? { ...rectifiedWarp.gridBounds }
-      : null;
     throwIfAborted(requestId);
-
-    // Resolve the marker lattice if enabled; otherwise keep the nominal grid and unrefined ROI views.
-    const alignmentInfo = config.useCrossAlignment
-      ? (
-        useMarkerlessAlignment
-          ? buildMarkerlessAlignmentData(
-              rectifiedWarp.visionMat,
-              config.frameCols,
-              config.frameRows,
-              config.crossRoiScale,
-              rectifiedWarp.gridBounds,
-              config.paperMarginXPx,
-              config.paperMarginYPx,
-              {
-                useDarkness: config.markerlessUseDarkness,
-                useTexture: config.markerlessUseTexture,
-                useVariance: config.markerlessUseVariance,
-                lightOnDark: config.lightOnDarkDesign,
-                blurScale: config.markerlessAutocorrelationBlurScale,
-              },
-            )
-          : buildCrossAlignmentData(
-              rectifiedWarp.visionMat,
-              config.frameCols,
-              config.frameRows,
-              config.crossRoiScale,
-              rectifiedWarp.gridBounds,
-              {
-                markerType: config.alignmentMarkerType,
-                includeCornerCrosses: rectifiedWarp.includeCornerCrosses,
-                detectCrossesWithConvolution: config.detectCrossesWithConvolution,
-              }
-            )
-      )
-      : buildUnrefinedCrossRegionInfo(
-          rectifiedWarp.visionMat,
-          config.frameCols,
-          config.frameRows,
-          "disabled",
-          rectifiedWarp.gridBounds,
-          config.crossRoiScale,
-          {
-            markerType: config.alignmentMarkerType,
-            includeCornerCrosses: rectifiedWarp.includeCornerCrosses,
-          }
-        );
-    // In the all-cross format, the coarse quad is only approximate; use the detected corner crosses
-    // to tighten the working grid bounds before frame extraction.
-    if (rectifiedWarp.includeCornerCrosses) {
-      refineAlignmentBoundsFromCornerCrosses(alignmentInfo);
-    }
-    throwIfAborted(requestId);
-
-    // Extract each animation frame from the styled rectified sheet with the chosen interpolation mode.
-    const frames = sliceRectifiedToCanvases(
-      rectifiedWarp.styledMat,
-      alignmentInfo,
-      config.crop,
-      getCvInterpolationFlag(config.exportOptions.resampling),
-      requestId,
-      throwIfAborted
-    );
-    const rectifiedCanvas = matToPreviewCanvas(rectifiedWarp.styledMat, RECTIFIED_PREVIEW_LONG_EDGE_PX);
-    const rectifiedMat = rectifiedWarp.styledMat;
-    rectifiedWarp.styledMat = null;
-    const statusText = buildStatusText({
-      threshVal,
-      rawWidth: sourceCanvas.width,
-      rawHeight: sourceCanvas.height,
-      pageAreaPct: pageQuad.areaPct,
-      pageWarpWidth: pageSizeLow.width,
-      pageWarpHeight: pageSizeLow.height,
-      highPageWarpWidth: pageSizeHigh.width,
-      highPageWarpHeight: pageSizeHigh.height,
-      alignmentInfo,
-      frameCount: frames.length,
-      expectedFrameCount: config.frameCols * config.frameRows,
-      rectifiedWidth: rectifiedMat.cols,
-      rectifiedHeight: rectifiedMat.rows,
-      animationWidth: frames[0]?.width || 0,
-      animationHeight: frames[0]?.height || 0,
-      gridDetector: "cross-only",
-    });
 
     return {
-      frames,
-      rectifiedCanvas,
-      rectifiedMat,
-      pagePreviewCanvas: pageWarpPreviewCanvas,
-      pagePreviewWidth: pageWarpPreviewWidth,
-      pagePreviewHeight: pageWarpPreviewHeight,
-      pagePreviewGridQuad: rectifiedWarp.previewGridQuad || null,
-      pagePreviewGridBounds,
-      alignmentInfo,
-      statusText,
-      pageQuadPoints: pageQuad.points,
+      rectifiedWarp,
+      pageQuad,
       pageQuadSource,
-      rectifiedDownloadUsesRawSource:
-        useNearIdentityRectification &&
-        useMarkerlessAlignment &&
-        Math.abs(Number(config.postRotationDeg) || 0) < 1e-6,
+      pageWarpPreviewCanvas,
+      pageWarpPreviewWidth,
+      pageWarpPreviewHeight,
+      useNearIdentityRectification,
+      threshVal,
+      pageSizeLow,
+      pageSizeHigh,
     };
   } catch (error) {
-    if (error?.name !== "ProcessAbortedError") {
-      if (error && typeof error === "object") {
-        error.partialResult = {
-          pageQuadPoints: pageQuad?.points || null,
-          pageQuadSource,
-          rectifiedCanvas: pageWarpPreviewCanvas,
-        };
-      }
+    if (error?.name !== "ProcessAbortedError" && error && typeof error === "object") {
+      error.partialResult = {
+        pageQuadPoints: pageQuad?.points || null,
+        pageQuadSource,
+        rectifiedCanvas: pageWarpPreviewCanvas,
+      };
     }
-    throw error;
-  } finally {
+    // On failure the caller never receives `rectifiedWarp`, so release it here to avoid a Mat leak.
     rectifiedWarp?.visionMat?.delete();
     rectifiedWarp?.styledMat?.delete();
+    throw error;
+  } finally {
     pageWarpLow?.visionMat?.delete();
     pageWarpLow?.styledMat?.delete();
     if (pageWarpHigh && pageWarpHigh.visionMat !== visionSrc) pageWarpHigh.visionMat?.delete();
@@ -876,6 +1174,12 @@ function makeManualPageQuad(points, sourceWidth, sourceHeight) {
  * detection on a small image. The low-res pass matches the live slider preview and is less prone to
  * choosing a one-pixel-connected image border when the paper/background tones are close.
  *
+ * The downscaled retry first reuses the user's threshold settings; if that still selects the image
+ * border (common when a bright background merges with the paper under the default offset-peak
+ * threshold), it falls back to Otsu candidates, which separate paper from a uniformly bright
+ * surface much more reliably. A rescue quad is only accepted when it is a substantial interior
+ * quad, so the user's threshold settings stay authoritative whenever they produce a real page.
+ *
  * This fallback is intentionally narrow: scanner-like inputs can still use the source boundary as
  * the page when the downscaled pass does not find a substantial interior quad.
  *
@@ -914,24 +1218,37 @@ function refineBorderPageQuadWithDownscaledDetection(
       0,
       cv.INTER_AREA
     );
-    applyPaperThreshold(previewGray, previewThresh, thresholdMethod, thresholdOffset);
-    const previewQuad = findLargestQuad(previewThresh, previewWidth * previewHeight);
-    if (isNearSourceBorderQuad(previewQuad.points, previewWidth, previewHeight)) return pageQuad;
-    if (previewQuad.areaPct < BORDER_QUAD_REFINEMENT_MIN_AREA_PCT) return pageQuad;
+    // Candidate threshold settings, tried in order until one yields a substantial interior quad.
+    // The user's own settings come first so explicit slider choices keep priority.
+    const thresholdCandidates = [
+      { method: thresholdMethod, offset: thresholdOffset },
+      { method: "otsu", offset: thresholdOffset },
+      { method: "otsu", offset: 0 },
+    ];
+    for (const candidate of thresholdCandidates) {
+      let previewQuad = null;
+      try {
+        applyPaperThreshold(previewGray, previewThresh, candidate.method, candidate.offset);
+        previewQuad = findLargestQuad(previewThresh, previewWidth * previewHeight);
+      } catch {
+        continue;
+      }
+      if (isNearSourceBorderQuad(previewQuad.points, previewWidth, previewHeight)) continue;
+      if (previewQuad.areaPct < BORDER_QUAD_REFINEMENT_MIN_AREA_PCT) continue;
 
-    const scaledPoints = previewQuad.points.map((point) => ({
-      x: point.x / scale,
-      y: point.y / scale,
-    }));
-    const scaledContourArea = previewQuad.areaPx / (scale * scale);
-    const scaledQuadArea = getPolygonArea(scaledPoints);
-    return {
-      points: scaledPoints,
-      areaPx: scaledContourArea,
-      quadAreaPx: scaledQuadArea,
-      areaPct: scaledContourArea / Math.max(1, sourceWidth * sourceHeight),
-    };
-  } catch {
+      const scaledPoints = previewQuad.points.map((point) => ({
+        x: point.x / scale,
+        y: point.y / scale,
+      }));
+      const scaledContourArea = previewQuad.areaPx / (scale * scale);
+      const scaledQuadArea = getPolygonArea(scaledPoints);
+      return {
+        points: scaledPoints,
+        areaPx: scaledContourArea,
+        quadAreaPx: scaledQuadArea,
+        areaPct: scaledContourArea / Math.max(1, sourceWidth * sourceHeight),
+      };
+    }
     return pageQuad;
   } finally {
     previewGray.delete();

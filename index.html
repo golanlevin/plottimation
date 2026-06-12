@@ -43,7 +43,7 @@
           </p>
           <p id="appLedeMobileNote" class="lede mobile-header-note" data-i18n="app.mobileNote">(Please use desktop version for advanced controls.)</p>
           <p id="appLedeSecondary" class="lede">
-            <span data-app-version>v1.17</span> • <a href="https://github.com/golanlevin/plottimation/tree/main/README.md" target="_blank" rel="noopener noreferrer" data-i18n="app.documentation">Instructions</a> • <a href="https://www.youtube.com/watch?v=MOXB63DgItQ" target="_blank" rel="noopener noreferrer" data-i18n="app.demoVideo">Demo Video</a> • <a href="templates/index.html" target="_blank" rel="noopener noreferrer" data-i18n="app.templates">Templates</a>
+            <span data-app-version>v1.18</span> • <a href="https://github.com/golanlevin/plottimation/tree/main/README.md" target="_blank" rel="noopener noreferrer" data-i18n="app.documentation">Instructions</a> • <a href="https://www.youtube.com/watch?v=MOXB63DgItQ" target="_blank" rel="noopener noreferrer" data-i18n="app.demoVideo">Demo Video</a> • <a href="templates/index.html" target="_blank" rel="noopener noreferrer" data-i18n="app.templates">Templates</a>
           </p>
           <p id="appLedeTertiary" class="lede"><span data-i18n="app.bylinePrefix">By @golanlevin, 2026 •</span> <a href="https://github.com/golanlevin/plottimation" target="_blank" rel="noopener noreferrer">Source</a></p>
         </div>
@@ -67,7 +67,18 @@
             <span id="dropGuidanceNote" class="drop-note" data-i18n="photo.dropNote">Animation frames should be separated
 by crosses, dots, or empty gutters.</span>
           </label>
-          <input id="fileInput" type="file" accept="image/*,.txt,text/plain" />
+          <input id="fileInput" type="file" accept="image/*,.txt,text/plain" multiple />
+          <!-- Per-frame image strip: visible only in per-frame mode (CSS keys off the
+               `per-frame-pipeline` body class). Lets the user switch the active image, reorder
+               frames (drag), delete frames, and add more. Populated by js/per-frame-strip.js. -->
+          <section id="perFrameStripPanel" class="per-frame-strip-panel" hidden>
+            <div class="per-frame-strip-head">
+              <h3 id="perFrameStripHeading" class="per-frame-strip-heading" data-i18n="photo.strip.heading">Frames</h3>
+              <span id="perFrameStripCount" class="per-frame-strip-count"></span>
+            </div>
+            <div id="perFrameStrip" class="per-frame-strip" role="list"></div>
+            <input id="perFrameStripFileInput" type="file" accept="image/*" multiple hidden />
+          </section>
         </section>
 
         <!-- Top-level choice between markerless gutter fitting and marker-based alignment. -->
@@ -81,6 +92,10 @@ by crosses, dots, or empty gutters.</span>
             <label class="toggle">
               <input id="alignmentPipelineMarkers" name="alignmentPipeline" type="radio" value="markers" checked />
               <span data-i18n="alignment.pipelineOptions.markers">Markers (crosses, dots)</span>
+            </label>
+            <label class="toggle">
+              <input id="alignmentPipelinePerFrame" name="alignmentPipeline" type="radio" value="per-frame" />
+              <span data-i18n="alignment.pipelineOptions.perFrame">Per-frame (one image per frame)</span>
             </label>
           </fieldset>
         </section>
@@ -114,6 +129,7 @@ by crosses, dots, or empty gutters.</span>
               <span id="paperPresetLabel" data-i18n="layout.paperSize">Paper Aspect</span>
               <select id="paperPreset">
                 <option value="source">Source</option>
+                <option value="square">Square (12×12 in)</option>
                 <option value="letter" selected>Letter (11×8.5 in)</option>
                 <option value="legal">Legal (14×8.5 in)</option>
                 <option value="tabloid">Tabloid (17×11 in)</option>
